@@ -16,31 +16,28 @@ import '../models/saved_skill.dart';
 /// Flow: User gives high-level goal → LLM reads screen → decides next action →
 /// executes → reads screen again → repeats until goal is complete.
 class TaskExecutor {
-  final AiService _aiService;
+  final AIService _aiService;
   final ScreenAutomationService _screenService;
   final AppLauncherService _appLauncher;
   final ShizukuService _shizukuService;
-  final NotificationService _notificationService = NotificationService();
-  final SkillMemoryService _skillMemory = SkillMemoryService();
-  final RecoveryEngine _recoveryEngine = RecoveryEngine();
-
-  /// Callback to report progress messages to the UI
+  final NotificationService _notificationService;
   final void Function(String message)? onProgress;
-
-  /// Set to true to cancel the running task
   bool _cancelled = false;
-  Completer<void>? _cancelCompleter;
 
   TaskExecutor({
-    required AiService aiService,
-    required ScreenAutomationService screenService,
-    required AppLauncherService appLauncher,
-    required ShizukuService shizukuService,
+    required AIService aiService,
+    ScreenAutomationService? screenService,
+    AppLauncherService? appLauncher,
+    ShizukuService? shizukuService,
+    NotificationService? notificationService,
+    SkillMemoryService? skillMemory,
     this.onProgress,
-  }) : _aiService = aiService,
-       _screenService = screenService,
-       _appLauncher = appLauncher,
-       _shizukuService = shizukuService;
+  })  : _aiService = aiService,
+        _screenService = screenService ?? ScreenAutomationService(),
+        _appLauncher = appLauncher ?? AppLauncherService(),
+        _shizukuService = shizukuService ?? ShizukuService(),
+        _notificationService = notificationService ?? NotificationService();
+
 
   /// Cancel the currently running task — takes effect immediately
   void cancel() {
