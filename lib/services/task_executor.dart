@@ -93,17 +93,24 @@ Rules:
 
     return text.trim();
   }
-    TaskExecutor({
+    class TaskExecutor {
+  final AIService _aiService;
+  final ScreenAutomationService _screenService;
+  final AppLauncherService _appLauncher;
+  final ShizukuService _shizukuService;
+  final void Function(String message)? onProgress;
+  bool _cancelled = false;
+
+  TaskExecutor({
+    required AIService aiService,
     ScreenAutomationService? screenService,
     AppLauncherService? appLauncher,
     ShizukuService? shizukuService,
-    required AIService aiService,
-    SkillMemoryService? skillMemory,
-  })  : _screenService = screenService ?? ScreenAutomationService(),
+    this.onProgress,
+  })  : _aiService = aiService,
+        _screenService = screenService ?? ScreenAutomationService(),
         _appLauncher = appLauncher ?? AppLauncherService(),
-        _shizukuService = shizukuService ?? ShizukuService(),
-        _aiService = aiService,
-        _skillMemory = skillMemory ?? SkillMemoryService();
+        _shizukuService = shizukuService ?? ShizukuService();
 
 
   /// Execute a multi-step task with LLM guidance
