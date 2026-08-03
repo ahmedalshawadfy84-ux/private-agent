@@ -95,20 +95,22 @@ Rules:
   final ScreenAutomationService _screenService;
   final AppLauncherService _appLauncher;
   final ShizukuService _shizukuService;
+  final NotificationService _notificationService;
   final void Function(String message)? onProgress;
-  bool _cancelled = false;
 
   TaskExecutor({
     required AIService aiService,
-    ScreenAutomationService? screenService,
-    AppLauncherService? appLauncher,
-    ShizukuService? shizukuService,
+    required ScreenAutomationService screenService,
+    required AppLauncherService appLauncher,
+    required ShizukuService shizukuService,
+    required NotificationService notificationService,
     this.onProgress,
   })  : _aiService = aiService,
-        _screenService = screenService ?? ScreenAutomationService(),
-        _appLauncher = appLauncher ?? AppLauncherService(),
-        _shizukuService = shizukuService ?? ShizukuService();
-
+        _screenService = screenService,
+        _appLauncher = appLauncher,
+        _shizukuService = shizukuService,
+        _notificationService = notificationService;
+}
 
   /// Execute a multi-step task with LLM guidance
   Future<String> executeTask(String userGoal) async {
