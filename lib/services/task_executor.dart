@@ -51,8 +51,8 @@ class TaskExecutor {
   }
 
   static const String _taskSystemPrompt = '''
-You are a phone automation agent. You are given a TASK and the current SCREEN content.
-You must decide what single action to take next to accomplish the task.
+You are a visual phone automation agent. You are given a TASK and a SCREENSHOT of the current phone screen.
+You must analyze the image visual layout and decide what single action to take next to accomplish the task.
 
 Respond with ONLY a JSON object (no markdown, no code fences):
 {
@@ -63,40 +63,26 @@ Respond with ONLY a JSON object (no markdown, no code fences):
 }
 
 Available actions:
-- click_text: {"text": "exact text to click"} - Click an element by its visible text
-- click_at: {"x": 540, "y": 960} - Click at screen coordinates (use bounds from screen dump)
-- type_text: {"text": "hello", "field_hint": "optional hint"} - Type into the focused/first edit field
-- press_enter: {} - Press the Enter/Search key on the keyboard to submit a search/form
-- scroll: {"direction": "down"} - Scroll down/up on the current view
-- swipe: {"startX": 540, "startY": 2000, "endX": 540, "endY": 500} - Swipe from start to end coordinates (e.g. open app drawer, navigate carousels)
-- press_back: {} - Press the back button
-- press_home: {} - Press the home button
-- open_app: {"app_name": "WhatsApp"} - Open an app
-- wait: {} - Wait a moment for content to load
-- done: {} - Task is complete
+- click_at: {"x": 540, "y": 960} - Click at exact visual screen coordinates (x, y) based on the image pixel location.
+- type_text: {"text": "hello"} - Type into the currently focused edit field or text box.
+- press_enter: {} - Press the Enter/Search key on the keyboard to submit.
+- scroll: {"direction": "down"} - Scroll down/up on the current view.
+- swipe: {"startX": 540, "startY": 2000, "endX": 540, "endY": 500} - Swipe from start to end coordinates.
+- press_back: {} - Press the back button.
+- press_home: {} - Press the home button.
+- open_app: {"app_name": "WhatsApp"} - Open an application directly.
+- wait: {} - Wait a moment for content to load.
+- done: {} - Task is complete.
 
 Rules:
-- You will receive a TEXT DUMP of the accessibility tree containing exact text strings and center coordinates.
-- ALWAYS use the text dump to decide your next action.
-- If you need to click something, prefer using `click_text`. If the element does not have text, use `click_at` with the coordinates provided in the text dump.
-- When typing in a search box, you MUST click it first, wait a step, and THEN type.
-- After typing a search query, use `press_enter` once. If the screen does not change, click the exact visible suggestion text. Do not repeat the same submit action more than twice.
-- Never scroll or swipe more than three times in a row. After three scrolls, choose the best visible result or take a different action instead of continuing to browse indefinitely.
-- Set is_complete=true ONLY when the task is fully done.
-- If you need to find something by scrolling, scroll and then check the screen again.
-- If you need to open an app (like Wikipedia, Spotify, etc.) and you cannot find it after a couple of scrolls, ASSUME it is not installed. Immediately open Chrome or Google to search for the info on the web instead.
-- If stuck after 3 attempts, set is_complete=true and explain in reasoning.
-- Keep reasoning very brief (1 sentence)
+- You will receive a visual SCREENSHOT of the device. Rely strictly on visual analysis of this screenshot.
+- Estimate precise (x, y) coordinates for target elements directly from the image aspect ratio and resolution.
+- When typing in a search box or field, click its visual location first with `click_at`, then type.
+- Set is_complete=true ONLY when the task is fully accomplished.
+- If stuck after 3 repeated identical attempts, set is_complete=true and explain in reasoning.
+- Keep reasoning very brief (1 sentence).
 ''';
 
-  /// Extract JSON safely even if wrapped in markdown or conversational text
-  String _extractJson(String text) {
-    // 1. Try to find a markdown json code block
-    final codeBlockRegex = RegExp(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```');
-    final match = codeBlockRegex.firstMatch(text);
-    if (match != null) {
-      return match.group(1)!;
-    }
 
     // 2. Fallback: find the first { and the last }
     final startIndex = text.indexOf('{');
@@ -227,7 +213,7 @@ Rules:
         return 'Task cancelled.';
       }
 
-      // Adaptive delay: give Android apps time to transition screens, load data, or open keyboards
+            // Adaptive delay: give Android apps time to transition screens, load data, or open keyboards
       int delay = 1200; // Default 1.2s delay for most actions
       if (lastAction == 'open_app') {
         delay = 3000; // Apps need ~3 seconds to fully cold-start and render
@@ -241,12 +227,10 @@ Rules:
       }
       await Future.delayed(Duration(milliseconds: delay));
 
-      // 1. Read the current screen text
-      final screenContent = _aiService.useScreenCompression
-          ? await _screenService.getCompressedScreenDescription(userGoal)
-          : await _screenService.getScreenDescription();
+      // 1. Capture current screenshot as Base64 for Pure Vision mode
+      final String? base64Image = await _screenService.takeScreenshotBase64();
       developer.log(
-        '=== SCREEN DUMP (Step ${step + 1}) ===\n$screenContent',
+        '=== CAPTURED SCREENSHOT (Step ${step + 1}) ===',
         name: 'PrivateAgent',
       );
 
@@ -259,24 +243,28 @@ Rules:
       String failureHint = '';
       if (consecutiveFailures >= 3) {
         failureHint =
-            '\n\nWARNING: You have failed $consecutiveFailures times in a row with the same approach. You MUST try a completely different action. If open_app failed, try press_home and look for the app icon on the home screen instead. If click_text failed, use click_at with coordinates. Do NOT repeat the same failed action.';
+            '\n\nWARNING: You have failed $consecutiveFailures times in a row with the same approach. You MUST try a completely different action. Try click_at with visual coordinates. Do NOT repeat the same failed action.';
       }
 
-      // 2. Build the prompt (system prompt is sent separately via sendTaskMessage)
+
+            // 2. Build the prompt for Pure Vision (system prompt is sent separately via sendTaskMessage)
       final prompt =
           '''TASK: $userGoal
-
-CURRENT SCREEN TEXT DUMP:
-$screenContent$prevResultStr$failureHint
-Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. What is the next action?''';
+$prevResultStr$failureHint
+Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image and identify elements visually. What is the next action?''';
 
       developer.log('=== AI PROMPT ===\n$prompt', name: 'PrivateAgent');
 
-      // 3. Get AI response — races against cancel signal so Stop works immediately
+      // 3. Get AI response with image payload — races against cancel signal so Stop works immediately
       String response;
       try {
         _cancelCompleter = Completer<void>();
-        final aiFuture = _aiService.sendTaskMessage(_taskSystemPrompt, prompt);
+        final aiFuture = _aiService.sendTaskMessage(
+          _taskSystemPrompt,
+          prompt,
+          base64Image: base64Image,
+        );
+
 
         // Race: whichever finishes first wins
         final result = await Future.any([
