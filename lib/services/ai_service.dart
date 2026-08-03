@@ -60,44 +60,30 @@ class AiService {
   final List<Map<String, String>> _conversationHistory = [];
 
   static const String _systemPrompt = '''
-You are PrivateAgent, a helpful AI assistant that controls an Android phone. You can perform device actions and also have normal conversations.
+You are PrivateAgent operating strictly in Pure Vision Mode. You control an Android device exclusively by analyzing screenshot images. You do NOT use or rely on UI accessibility trees, element IDs, or XML text nodes.
 
-When the user wants to perform a device action, you MUST respond with ONLY a JSON object (no markdown, no code fences, no extra text) in this exact format:
-{"action": "action_name", "params": {"key": "value"}, "response": "What you say to the user"}
+CRITICAL RULES FOR PURE VISION:
+1. Analyze the raw screen image visually to detect UI components, buttons, and target controls.
+2. Perform all physical interactions by providing exact screen coordinates (X, Y).
+3. Always respond ONLY with a valid JSON object using the required format.
 
-Available actions and their params:
+AVAILABLE ACTIONS:
+- tap: {"x": 500, "y": 1200} -> Tap at exact (X, Y) coordinates on screen.
+- long_press: {"x": 500, "y": 1200} -> Long press at specific coordinates.
+- swipe: {"start_x": 500, "start_y": 1500, "end_x": 500, "end_y": 500} -> Drag/swipe across the screen.
+- type_text: {"text": "text_here"} -> Type text into an active input field.
+- press_back: {} -> Trigger Android back button.
+- press_home: {} -> Return to phone home screen.
+- open_app: {"app_name": "app_name"} -> Open an application directly.
 
-SIMPLE ACTIONS (single step only):
-- open_app: {"app_name": "YouTube"} - ONLY use this when the user JUST wants to open an app and nothing else
-- make_call: {"contact_name": "Mom"} OR {"phone_number": "1234567890"} - Makes a phone call
-- send_sms: {"contact_name": "John", "message": "Hello"} OR {"phone_number": "123", "message": "Hi"} - Sends SMS
-- search_contact: {"query": "John"} - Searches contacts
-- set_alarm: {"hour": 7, "minute": 30, "label": "Wake up"} - Sets an alarm
-- set_volume: {"level": 50} - Sets volume (0-100)
-- set_brightness: {"level": 50} - Sets brightness (0-100)
-- read_screen: {} - Read what's currently on the screen
-- press_back: {} - Press the back button
-
-MULTI-STEP TASK (for anything that requires more than one action):
-- execute_task: {"goal": "description of the full task"} - Automatically reads screen, taps, scrolls, types step by step
-
-CRITICAL RULES:
-1. If the user request contains "and" or involves MULTIPLE steps (open + search, open + send, open + find, etc.), you MUST use execute_task. NEVER use open_app for these.
-2. execute_task handles everything: opening apps, finding elements, clicking, typing, scrolling.
-
-Examples of when to use execute_task:
-- "Create a new alarm for 7 AM" → execute_task with goal "Create a new alarm for 7 AM"
-- "Go to YouTube and search for cats" → execute_task
-- "Open WhatsApp and send hello to John" → execute_task
-- "Open Settings and turn on WiFi" → execute_task
-- "Search for restaurants on Google Maps" → execute_task
-
-Examples of when to use open_app:
-- "Open YouTube" → open_app (just opening, no further action)
-- "Open Settings" → open_app (just opening)
-
-For normal conversation (questions, chat, info requests), just respond with plain text naturally.
+JSON RESPONSE FORMAT:
+{
+  "action": "action_name",
+  "params": { ... },
+  "response": "Brief explanation of the action being taken"
+}
 ''';
+
 
   static const String _chatSystemPrompt = '''
 You are PrivateAgent, a helpful conversational AI assistant. 
@@ -469,7 +455,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
 
   /// Send a task execution message — no conversation history, low temperature, limited tokens.
   /// This is much faster and cheaper than sendMessage.
-  Future<AiResponse> sendTaskMessage(String systemPrompt, String prompt) async {
+  Future<AiResponse> sendTaskMessage(String systemPrompt, String prompt, {String? base64Image}) async {
     if (_apiKey == null || _apiKey!.isEmpty) {
       throw Exception('API Key is not configured. Please go to Settings.');
     }
@@ -480,9 +466,26 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     while (true) {
       try {
         currentTry++;
+        
+        // إعداد محتوى رسالة المستخدم لدعم وضع Vision
+        dynamic userContent;
+        if (base64Image != null && base64Image.isNotEmpty) {
+          userContent = [
+            {'type': 'text', 'text': prompt},
+            {
+              'type': 'image_url',
+              'image_url': {
+                'url': 'data:image/png;base64,$base64Image'
+              }
+            }
+          ];
+        } else {
+          userContent = prompt;
+        }
+
         final messages = [
           if (_useSystemPrompt) {'role': 'system', 'content': systemPrompt},
-          {'role': 'user', 'content': prompt},
+          {'role': 'user', 'content': userContent},
         ];
 
         String requestUrl = _baseUrl;
