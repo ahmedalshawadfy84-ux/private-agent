@@ -16,28 +16,31 @@ import '../models/saved_skill.dart';
 /// Flow: User gives high-level goal → LLM reads screen → decides next action →
 /// executes → reads screen again → repeats until goal is complete.
 class TaskExecutor {
-  final AIService _aiService;
+  final AiService _aiService;
   final ScreenAutomationService _screenService;
   final AppLauncherService _appLauncher;
   final ShizukuService _shizukuService;
-  final NotificationService _notificationService;
+  final NotificationService _notificationService = NotificationService();
+  final SkillMemoryService _skillMemory = SkillMemoryService();
+  final RecoveryEngine _recoveryEngine = RecoveryEngine();
+
+  /// Callback to report progress messages to the UI
   final void Function(String message)? onProgress;
+
+  /// Set to true to cancel the running task
   bool _cancelled = false;
+  Completer<void>? _cancelCompleter;
 
   TaskExecutor({
-    required AIService aiService,
-    ScreenAutomationService? screenService,
-    AppLauncherService? appLauncher,
-    ShizukuService? shizukuService,
-    NotificationService? notificationService,
-    SkillMemoryService? skillMemory,
+    required AiService aiService,
+    required ScreenAutomationService screenService,
+    required AppLauncherService appLauncher,
+    required ShizukuService shizukuService,
     this.onProgress,
-  })  : _aiService = aiService,
-        _screenService = screenService ?? ScreenAutomationService(),
-        _appLauncher = appLauncher ?? AppLauncherService(),
-        _shizukuService = shizukuService ?? ShizukuService(),
-        _notificationService = notificationService ?? NotificationService();
-
+  }) : _aiService = aiService,
+       _screenService = screenService,
+       _appLauncher = appLauncher,
+       _shizukuService = shizukuService;
 
   /// Cancel the currently running task — takes effect immediately
   void cancel() {
@@ -77,9 +80,17 @@ Rules:
 - When typing in a search box or field, click its visual location first with `click_at`, then type.
 - Set is_complete=true ONLY when the task is fully accomplished.
 - If stuck after 3 repeated identical attempts, set is_complete=true and explain in reasoning.
-- Keep reasoning very brief (1 sentence).
+- Keep reasoning very brief (1 sentence)
 ''';
 
+  /// Extract JSON safely even if wrapped in markdown or conversational text
+  String _extractJson(String text) {
+    // 1. Try to find a markdown json code block
+    final codeBlockRegex = RegExp(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```');
+    final match = codeBlockRegex.firstMatch(text);
+    if (match != null) {
+      return match.group(1)!;
+    }
 
     // 2. Fallback: find the first { and the last }
     final startIndex = text.indexOf('{');
@@ -90,27 +101,6 @@ Rules:
 
     return text.trim();
   }
-    class TaskExecutor {
-  final AIService _aiService;
-  final ScreenAutomationService _screenService;
-  final AppLauncherService _appLauncher;
-  final ShizukuService _shizukuService;
-  final NotificationService _notificationService;
-  final void Function(String message)? onProgress;
-
-  TaskExecutor({
-    required AIService aiService,
-    required ScreenAutomationService screenService,
-    required AppLauncherService appLauncher,
-    required ShizukuService shizukuService,
-    required NotificationService notificationService,
-    this.onProgress,
-  })  : _aiService = aiService,
-        _screenService = screenService,
-        _appLauncher = appLauncher,
-        _shizukuService = shizukuService,
-        _notificationService = notificationService;
-}
 
   /// Execute a multi-step task with LLM guidance
   Future<String> executeTask(String userGoal) async {
@@ -231,7 +221,7 @@ Rules:
         return 'Task cancelled.';
       }
 
-            // Adaptive delay: give Android apps time to transition screens, load data, or open keyboards
+      // Adaptive delay: give Android apps time to transition screens, load data, or open keyboards
       int delay = 1200; // Default 1.2s delay for most actions
       if (lastAction == 'open_app') {
         delay = 3000; // Apps need ~3 seconds to fully cold-start and render
@@ -245,10 +235,12 @@ Rules:
       }
       await Future.delayed(Duration(milliseconds: delay));
 
-      // 1. Capture current screenshot as Base64 for Pure Vision mode
-      final String? base64Image = await _screenService.takeScreenshotBase64();
+      // 1. Read the current screen text
+      final screenContent = _aiService.useScreenCompression
+          ? await _screenService.getCompressedScreenDescription(userGoal)
+          : await _screenService.getScreenDescription();
       developer.log(
-        '=== CAPTURED SCREENSHOT (Step ${step + 1}) ===',
+        '=== SCREEN DUMP (Step ${step + 1}) ===\n$screenContent',
         name: 'PrivateAgent',
       );
 
@@ -261,11 +253,10 @@ Rules:
       String failureHint = '';
       if (consecutiveFailures >= 3) {
         failureHint =
-            '\n\nWARNING: You have failed $consecutiveFailures times in a row with the same approach. You MUST try a completely different action. Try click_at with visual coordinates. Do NOT repeat the same failed action.';
+            '\n\nWARNING: You have failed $consecutiveFailures times in a row with the same approach. You MUST try a completely different action. If open_app failed, try press_home and look for the app icon on the home screen instead. If click_text failed, use click_at with coordinates. Do NOT repeat the same failed action.';
       }
 
-
-            // 2. Build the prompt for Pure Vision (system prompt is sent separately via sendTaskMessage)
+      // 2. Build the prompt for Pure Vision (system prompt is sent separately via sendTaskMessage)
       final prompt =
           '''TASK: $userGoal
 $prevResultStr$failureHint
@@ -282,8 +273,6 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
           prompt,
           base64Image: base64Image,
         );
-
-
         // Race: whichever finishes first wins
         final result = await Future.any([
           aiFuture.then((r) => r),
