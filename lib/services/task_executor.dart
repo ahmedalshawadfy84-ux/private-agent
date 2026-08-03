@@ -93,15 +93,18 @@ Rules:
 
     return text.trim();
   }
-  TaskExecutor({
+    TaskExecutor({
     ScreenAutomationService? screenService,
     AppLauncherService? appLauncher,
     ShizukuService? shizukuService,
     required AIService aiService,
+    SkillMemoryService? skillMemory,
   })  : _screenService = screenService ?? ScreenAutomationService(),
         _appLauncher = appLauncher ?? AppLauncherService(),
         _shizukuService = shizukuService ?? ShizukuService(),
-        _aiService = aiService;
+        _aiService = aiService,
+        _skillMemory = skillMemory ?? SkillMemoryService();
+
 
   /// Execute a multi-step task with LLM guidance
   Future<String> executeTask(String userGoal) async {
