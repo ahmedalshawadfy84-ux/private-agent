@@ -76,9 +76,11 @@ Available actions:
 
 Rules:
 - You will receive a visual SCREENSHOT of the device. Rely strictly on visual analysis of this screenshot.
-- Estimate precise (x, y) coordinates for target elements directly from the image aspect ratio and resolution.
+- Estimate precise (x, y) coordinates for target elements directly from the image.
 - When typing in a search box or field, click its visual location first with `click_at`, then type.
-- Set is_complete=true ONLY when the task is fully accomplished.
+- Set is_complete=true ONLY when the ENTIRE task is fully finished (e.g. level completed, message sent, goal achieved).
+- NEVER set is_complete=true after just opening an app or after a single click.
+- If the task requires multiple steps (open app + play level + complete it), keep is_complete=false until the final goal is reached.
 - If stuck after 3 repeated identical attempts, set is_complete=true and explain in reasoning.
 - Keep reasoning very brief (1 sentence)
 ''';
