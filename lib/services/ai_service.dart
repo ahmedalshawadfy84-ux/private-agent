@@ -16,9 +16,6 @@ class AiService {
   static const String nvidiaBaseUrl = 'https://integrate.api.nvidia.com/v1';
   static const String nvidiaDefaultModel = 'z-ai/glm-5.2';
 
-  /// Free, general-purpose chat endpoints verified in NVIDIA's NIM catalog.
-  /// The live /models response is intersected with this list so unavailable or
-  /// non-chat models never appear in PrivateAgent's NVIDIA model picker.
   static const List<String> nvidiaFreeChatModels = [
     'z-ai/glm-5.2',
     'nvidia/nemotron-3-nano-30b-a3b',
@@ -66,10 +63,13 @@ CRITICAL RULES:
 1. Analyze the screenshot visually to detect buttons, icons, text, and interactive elements.
 2. Respond with ONLY a valid JSON object (no markdown, no extra text).
 3. Perform one action at a time.
-4. Set "is_complete": true ONLY when the ENTIRE user goal is fully achieved.
-5. NEVER set is_complete=true after just opening an app or after a single tap. Multi-step tasks must continue until the final goal is done.
+4. Always respond and explain your reasoning in the SAME LANGUAGE as the user's input (e.g., if user speaks Arabic, write reasoning in Arabic).
+5. If the user input is a casual conversation, greeting (like "مرحبا" or "hello"), or a general question that DOES NOT require clicking or interacting with the screen, use the "chat" action.
+6. Set "is_complete": true ONLY when the ENTIRE user goal is fully achieved or when replying to a casual chat/greeting.
+7. NEVER set is_complete=true after just opening an app or after a single tap for multi-step tasks.
 
 AVAILABLE ACTIONS:
+- chat: {"message": "Your text response to the user"} - Use for general conversation, greetings, or answers not requiring screen interaction.
 - click_at: {"x": 540, "y": 960} - Tap at exact screen coordinates
 - type_text: {"text": "hello"} - Type into the focused text field
 - press_enter: {} - Press Enter/Search key
@@ -79,22 +79,20 @@ AVAILABLE ACTIONS:
 - press_home: {} - Press Home button
 - open_app: {"app_name": "WhatsApp"} - Open an app by name
 - wait: {} - Wait a moment for the screen to load
-- done: {} - Use only when the full task is completely finished
+- done: {} - Use only when a multi-step device task is completely finished
 
 JSON RESPONSE FORMAT (strict):
 {
   "action": "action_name",
   "params": {},
-  "reasoning": "short reason",
+  "reasoning": "Explanation in user's language",
   "is_complete": false
 }
 ''';
 
-
-static const String _chatSystemPrompt = '''
+  static const String _chatSystemPrompt = '''
 You are PrivateAgent, a helpful conversational AI assistant. 
-Provide direct, natural, and friendly text responses. You cannot perform device actions or run tools. 
-Answer questions, explain concepts, brainstorm, write emails/messages, and chat with the user in plain text or markdown format.
+Provide direct, natural, and friendly responses in the same language used by the user. You cannot perform device actions or run tools in this mode.
 ''';
 
   Future<void> init() async {
@@ -116,16 +114,12 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     String? model,
   }) async {
     final prefs = await SharedPreferences.getInstance();
-
-    // Clean up the API key in case the user pasted "Bearer sk-..."
     String cleanApiKey = apiKey.trim();
     if (cleanApiKey.toLowerCase().startsWith('bearer ')) {
       cleanApiKey = cleanApiKey.substring(7).trim();
     }
-
     _apiKey = cleanApiKey;
     await prefs.setString('api_key', cleanApiKey);
-
     if (baseUrl != null && baseUrl.isNotEmpty) {
       _baseUrl = baseUrl;
       await prefs.setString('api_base_url', baseUrl);
@@ -170,7 +164,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
   String get model => _model;
   String get apiKey => _apiKey ?? '';
   int get maxSteps => _disableMaxSteps ? 999 : _maxSteps;
-  int get rawMaxSteps => _maxSteps; // For the slider UI
+  int get rawMaxSteps => _maxSteps;
   bool get disableMaxSteps => _disableMaxSteps;
   double get temperature => _temperature;
   int get maxTokens => _maxTokens;
@@ -178,8 +172,6 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
   bool get useSystemPrompt => _useSystemPrompt;
 
   int get _effectiveMaxTokens {
-    // GLM is a reasoning model. With the app's 1,024-token default it can
-    // consume the whole budget reasoning and finish without visible content.
     if (isNvidiaBaseUrl(_baseUrl) &&
         _model == nvidiaDefaultModel &&
         _maxTokens < 4096) {
@@ -199,39 +191,28 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     }
   }
 
-  /// Send a message to the AI and get a response.
   Future<String> sendMessage(String message, {bool isAgentMode = true}) async {
     if (_apiKey == null || _apiKey!.isEmpty) {
       throw Exception('API Key is not configured. Please go to Settings.');
     }
-
-    // Add ONLY the text to the persistent conversation history to save tokens.
     _conversationHistory.add({'role': 'user', 'content': message});
-
-    // Keep conversation history manageable (last 20 messages)
     if (_conversationHistory.length > 20) {
       _conversationHistory.removeRange(0, _conversationHistory.length - 20);
     }
-
     try {
-      // Build the prompt including system instructions
       final systemPrompt = isAgentMode ? _systemPrompt : _chatSystemPrompt;
       final messages = [
         if (_useSystemPrompt) {'role': 'system', 'content': systemPrompt},
         ..._conversationHistory,
       ];
-
       String requestUrl = _baseUrl;
-      if (requestUrl.endsWith('/chat/completions')) {
-        requestUrl = requestUrl; // User already included it
-      } else {
+      if (!requestUrl.endsWith('/chat/completions')) {
         if (requestUrl.endsWith('/')) {
           requestUrl = '${requestUrl}chat/completions';
         } else {
           requestUrl = '$requestUrl/chat/completions';
         }
       }
-
       final requestBody = jsonEncode({
         'model': _model,
         'messages': messages,
@@ -239,16 +220,11 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
         'max_tokens': _effectiveMaxTokens,
       });
 
-      developer.log(
-        'API Request: $requestUrl\n$requestBody',
-        name: 'AiService',
-      );
-
       final response = await http
           .post(
             Uri.parse(requestUrl),
             headers: {
-              'Content-Type': 'application/json',
+              'Content-Type': 'application/json; charset=utf-8',
               'Authorization': 'Bearer $_apiKey',
               'HTTP-Referer': 'https://github.com/orailnoor/private-agent',
               'X-Title': 'PrivateAgent',
@@ -257,53 +233,40 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
           )
           .timeout(const Duration(minutes: 30));
 
-      developer.log(
-        'API Response [${response.statusCode}]: ${response.body}',
-        name: 'AiService',
-      );
+      final responseBody = utf8.decode(response.bodyBytes);
 
       if (response.statusCode != 200) {
-        String errorMessage = response.body;
+        String errorMessage = responseBody;
         try {
-          final decoded = jsonDecode(response.body);
+          final decoded = jsonDecode(responseBody);
           if (decoded is Map<String, dynamic>) {
             if (decoded['error'] is Map<String, dynamic>) {
-              errorMessage =
-                  decoded['error']['message']?.toString() ?? response.body;
+              errorMessage = decoded['error']['message']?.toString() ?? responseBody;
             } else if (decoded['error'] is String) {
               errorMessage = decoded['error'];
             }
           }
-        } catch (_) {
-          // ignore parsing errors, use raw body
-        }
+        } catch (_) {}
         throw Exception('API error (${response.statusCode}): $errorMessage');
       }
 
-      final data = jsonDecode(response.body);
+      final data = jsonDecode(responseBody);
       if (data is! Map<String, dynamic> || !data.containsKey('choices')) {
         throw Exception('Unexpected API response format: $data');
       }
-
       String assistantMessage =
           data['choices'][0]['message']['content'] as String;
-
-      // Strip <think> blocks commonly produced by reasoning models
       assistantMessage = assistantMessage
           .replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '')
           .trim();
 
       if (assistantMessage.trim().isEmpty) {
-        throw Exception(
-          'API returned an empty response. This may be due to rate limits or API instability.',
-        );
+        throw Exception('API returned an empty response.');
       }
-
       _conversationHistory.add({
         'role': 'assistant',
         'content': assistantMessage,
       });
-
       return assistantMessage;
     } catch (e) {
       if (e is Exception) rethrow;
@@ -311,7 +274,6 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     }
   }
 
-  /// Send a message and stream the response chunk-by-chunk.
   Stream<String> sendMessageStream(
     String message, {
     bool isAgentMode = true,
@@ -319,40 +281,32 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     if (_apiKey == null || _apiKey!.isEmpty) {
       throw Exception('API Key is not configured. Please go to Settings.');
     }
-
     _conversationHistory.add({'role': 'user', 'content': message});
-
     if (_conversationHistory.length > 20) {
       _conversationHistory.removeRange(0, _conversationHistory.length - 20);
     }
-
     try {
       final systemPrompt = isAgentMode ? _systemPrompt : _chatSystemPrompt;
       final messages = [
         if (_useSystemPrompt) {'role': 'system', 'content': systemPrompt},
         ..._conversationHistory,
       ];
-
       String requestUrl = _baseUrl;
-      if (requestUrl.endsWith('/chat/completions')) {
-        requestUrl = requestUrl;
-      } else {
+      if (!requestUrl.endsWith('/chat/completions')) {
         if (requestUrl.endsWith('/')) {
           requestUrl = '${requestUrl}chat/completions';
         } else {
           requestUrl = '$requestUrl/chat/completions';
         }
       }
-
       final client = http.Client();
       final request = http.Request('POST', Uri.parse(requestUrl));
       request.headers.addAll({
-        'Content-Type': 'application/json',
+        'Content-Type': 'application/json; charset=utf-8',
         'Authorization': 'Bearer $_apiKey',
         'HTTP-Referer': 'https://github.com/orailnoor/private-agent',
         'X-Title': 'PrivateAgent',
       });
-
       request.body = jsonEncode({
         'model': _model,
         'messages': messages,
@@ -367,25 +321,12 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
 
       if (response.statusCode != 200) {
         final body = await response.stream.bytesToString();
-        String errorMessage = body;
-        try {
-          final decoded = jsonDecode(body);
-          if (decoded is Map<String, dynamic>) {
-            if (decoded['error'] is Map<String, dynamic>) {
-              errorMessage = decoded['error']['message']?.toString() ?? body;
-            } else if (decoded['error'] is String) {
-              errorMessage = decoded['error'];
-            }
-          }
-        } catch (_) {}
         client.close();
-        throw Exception('API error (${response.statusCode}): $errorMessage');
+        throw Exception('API error (${response.statusCode}): $body');
       }
 
       final accumulatedContent = StringBuffer();
       bool inThinkBlock = false;
-
-      // Listen to response stream
       final lineStream = response.stream
           .transform(utf8.decoder)
           .transform(const LineSplitter());
@@ -409,22 +350,14 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
                 if (rawContent is String && rawContent.isNotEmpty) {
                   final content = rawContent;
                   accumulatedContent.write(content);
-
-                  // Handle <think> block stripping on the fly for better stream styling
                   if (content.contains('<think>')) {
                     inThinkBlock = true;
-                    // If there is text before <think>, yield it
                     final parts = content.split('<think>');
-                    if (parts[0].isNotEmpty) {
-                      yield parts[0];
-                    }
+                    if (parts[0].isNotEmpty) yield parts[0];
                   } else if (content.contains('</think>')) {
                     inThinkBlock = false;
-                    // If there is text after </think>, yield it
                     final parts = content.split('</think>');
-                    if (parts.length > 1 && parts[1].isNotEmpty) {
-                      yield parts[1];
-                    }
+                    if (parts.length > 1 && parts[1].isNotEmpty) yield parts[1];
                   } else if (!inThinkBlock) {
                     yield content;
                   }
@@ -432,25 +365,16 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
                 if (choice['finish_reason'] != null) break;
               }
             }
-          } catch (_) {
-            // Ignore incomplete chunks
-          }
+          } catch (_) {}
         }
       }
-
       client.close();
-
-      // Clean up final accumulated response and add to history
       String finalResponse = accumulatedContent.toString().trim();
       finalResponse = finalResponse
           .replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '')
           .trim();
-
       if (finalResponse.isEmpty) {
-        throw Exception(
-          'The model finished without a visible answer. Increase Max Tokens '
-          'or try another NVIDIA model.',
-        );
+        throw Exception('The model finished without a visible answer.');
       }
       _conversationHistory.add({'role': 'assistant', 'content': finalResponse});
     } catch (e) {
@@ -459,21 +383,15 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     }
   }
 
-  /// Send a task execution message — no conversation history, low temperature, limited tokens.
-  /// This is much faster and cheaper than sendMessage.
   Future<AiResponse> sendTaskMessage(String systemPrompt, String prompt, {String? base64Image}) async {
     if (_apiKey == null || _apiKey!.isEmpty) {
       throw Exception('API Key is not configured. Please go to Settings.');
     }
-
     int maxRetries = 4;
     int currentTry = 0;
-
     while (true) {
       try {
         currentTry++;
-        
-        // إعداد محتوى رسالة المستخدم لدعم وضع Vision
         dynamic userContent;
         if (base64Image != null && base64Image.isNotEmpty) {
           userContent = [
@@ -488,12 +406,10 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
         } else {
           userContent = prompt;
         }
-
         final messages = [
           if (_useSystemPrompt) {'role': 'system', 'content': systemPrompt},
           {'role': 'user', 'content': userContent},
         ];
-
         String requestUrl = _baseUrl;
         if (!requestUrl.endsWith('/chat/completions')) {
           if (requestUrl.endsWith('/')) {
@@ -502,12 +418,11 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
             requestUrl = '$requestUrl/chat/completions';
           }
         }
-
         final response = await http
             .post(
               Uri.parse(requestUrl),
               headers: {
-                'Content-Type': 'application/json',
+                'Content-Type': 'application/json; charset=utf-8',
                 'Authorization': 'Bearer $_apiKey',
                 'HTTP-Referer': 'https://github.com/orailnoor/private-agent',
                 'X-Title': 'PrivateAgent',
@@ -521,43 +436,37 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
             )
             .timeout(const Duration(minutes: 30));
 
+        final responseBody = utf8.decode(response.bodyBytes);
+
         if (response.statusCode != 200) {
-          String errorMessage = response.body;
+          String errorMessage = responseBody;
           try {
-            final decoded = jsonDecode(response.body);
+            final decoded = jsonDecode(responseBody);
             if (decoded is Map<String, dynamic>) {
               if (decoded['error'] is Map<String, dynamic>) {
-                errorMessage = decoded['error']['message'] ?? response.body;
+                errorMessage = decoded['error']['message'] ?? responseBody;
               } else if (decoded['error'] is String) {
                 errorMessage = decoded['error'];
               }
             }
-          } catch (_) {
-            // ignore parsing errors, use raw body
-          }
+          } catch (_) {}
           throw Exception('API error (${response.statusCode}): $errorMessage');
         }
 
-        final data = jsonDecode(response.body);
+        final data = jsonDecode(responseBody);
         if (data is! Map<String, dynamic> || !data.containsKey('choices')) {
           throw Exception('Unexpected API response format: $data');
         }
         String content = data['choices'][0]['message']['content'] as String;
-
-        // Strip <think> blocks commonly produced by reasoning models
         content = content
             .replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '')
             .trim();
 
         if (content.trim().isEmpty) {
-          throw Exception(
-            'API returned an empty response. This may be due to strict rate limits or safety filters.',
-          );
+          throw Exception('API returned an empty response.');
         }
-
         int tokens = 0;
-        if (data.containsKey('usage') &&
-            data['usage']['total_tokens'] != null) {
+        if (data.containsKey('usage') && data['usage']['total_tokens'] != null) {
           tokens = data['usage']['total_tokens'] as int;
         }
         return AiResponse(content, tokens);
@@ -576,27 +485,21 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     }
   }
 
-  /// Parse the AI response to check if it's an action or plain text
   AgentAction? parseAction(String response) {
-    // Try to parse as JSON action
     try {
       final trimmed = response.trim();
-      // Handle if the response is wrapped in code fences
       String jsonStr = trimmed;
       if (trimmed.startsWith('```')) {
         final lines = trimmed.split('\n');
-        lines.removeAt(0); // Remove opening fence
+        lines.removeAt(0);
         if (lines.isNotEmpty && lines.last.trim() == '```') {
-          lines.removeLast(); // Remove closing fence
+          lines.removeLast();
         }
         jsonStr = lines.join('\n').trim();
       }
-
-      // If it looks like JSON but is missing a closing brace (common with some local models)
       if (jsonStr.startsWith('{') && !jsonStr.endsWith('}')) {
         jsonStr += '\n}';
       }
-
       if (jsonStr.startsWith('{') && jsonStr.contains('"action"')) {
         try {
           final json = jsonDecode(jsonStr) as Map<String, dynamic>;
@@ -604,7 +507,6 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
             return AgentAction.fromJson(json);
           }
         } catch (e) {
-          // If it still fails, it might be deeply truncated, try adding another brace
           if (e.toString().contains('Unexpected end of input')) {
             jsonStr += '\n}';
             final json = jsonDecode(jsonStr) as Map<String, dynamic>;
@@ -614,31 +516,26 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
           }
         }
       }
-    } catch (_) {
-      // Not JSON, it's plain text conversation
-    }
+    } catch (_) {}
     return null;
   }
 
-  /// Fetches available models from the provider's /models endpoint
   Future<List<String>> fetchAvailableModels(
     String baseUrl,
     String apiKey,
   ) async {
     try {
       String cleanBaseUrl = baseUrl;
-      // Many providers host it at /models, but some require the base URL without /chat/completions logic
       if (cleanBaseUrl.endsWith('/chat/completions')) {
         cleanBaseUrl = cleanBaseUrl.replaceAll('/chat/completions', '');
       }
-
       final response = await http.get(
         Uri.parse('$cleanBaseUrl/models'),
         headers: {'Authorization': 'Bearer $apiKey'},
       );
-
       if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
+        final responseBody = utf8.decode(response.bodyBytes);
+        final data = jsonDecode(responseBody);
         List<String> models;
         if (data is Map && data.containsKey('data')) {
           final modelsList = data['data'] as List;
@@ -648,7 +545,6 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
         } else {
           return [];
         }
-
         if (isNvidiaBaseUrl(cleanBaseUrl)) {
           return filterNvidiaFreeModels(models);
         }
