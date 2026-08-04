@@ -78,11 +78,12 @@ Rules:
 - You will receive a visual SCREENSHOT of the device. Rely strictly on visual analysis of this screenshot.
 - Estimate precise (x, y) coordinates for target elements directly from the image.
 - When typing in a search box or field, click its visual location first with `click_at`, then type.
-- Set is_complete=true ONLY when the ENTIRE task is fully finished (e.g. level completed, message sent, goal achieved).
-- NEVER set is_complete=true after just opening an app or after a single click.
-- If the task requires multiple steps (open app + play level + complete it), keep is_complete=false until the final goal is reached.
+- Set is_complete=true ONLY when the ENTIRE task is fully finished (e.g. level completed, message sent, final goal achieved).
+- NEVER set is_complete=true after just opening an app or after a single click/tap.
+- Multi-step tasks must continue until the final goal is reached.
 - If stuck after 3 repeated identical attempts, set is_complete=true and explain in reasoning.
 - Keep reasoning very brief (1 sentence)
+''';
 ''';
 
   /// Extract JSON safely even if wrapped in markdown or conversational text
@@ -464,11 +465,12 @@ try {
           break;
 
         case 'click_at':
-          final x = (params['x'] as num?)?.toDouble() ?? 0;
-          final y = (params['y'] as num?)?.toDouble() ?? 0;
-          success = await _screenService.clickAt(x, y);
-          actionResult = success ? 'Clicked at ($x, $y)' : 'Click failed';
-          break;
+case 'tap':
+  final x = (params['x'] as num?)?.toDouble() ?? 0;
+  final y = (params['y'] as num?)?.toDouble() ?? 0;
+  success = await _screenService.clickAt(x, y);
+  actionResult = success ? 'Clicked at ($x, $y)' : 'Click failed';
+  break;
 
         case 'type_text':
           final text = params['text'] as String? ?? '';
