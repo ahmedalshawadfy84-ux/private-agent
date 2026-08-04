@@ -238,7 +238,8 @@ Rules:
       await Future.delayed(Duration(milliseconds: delay));
 
       // 1. Capture current screenshot as Base64 for Pure Vision mode
-      final String? base64Image = await _screenService.takeScreenshotBase64();
+      final String? base64Image = await _screenService.takeScreenshot();
+
       developer.log(
         '=== CAPTURED SCREENSHOT (Step ${step + 1}) ===',
         name: 'PrivateAgent',
@@ -569,7 +570,7 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
           return 'I could not complete the task. Please try again.';
         }
 
-        final recovery = await _recoveryEngine.diagnose(action, screenContent);
+        final recovery = await _recoveryEngine.diagnose(action, base64Image ?? "");
         _report('Recovering: ${recovery.description}');
 
         if (recovery.action == 'wait') {
