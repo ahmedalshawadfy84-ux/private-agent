@@ -265,13 +265,18 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
       developer.log('=== AI PROMPT ===\n$prompt', name: 'PrivateAgent');
 
       // 3. Get AI response with image payload — races against cancel signal so Stop works immediately
-      String response;
-      try {
-        _cancelCompleter = Completer<void>();
-        final aiFuture = _aiService.sendTaskMessage(
-          _taskSystemPrompt,
-          prompt,
-          base64Image: base64Image,
+String response;
+try {
+  _cancelCompleter = Completer<void>();
+
+  // التقاط لقطة الشاشة وإرسالها للـ AI
+  final String? base64Image = await _screenService.takeScreenshot();
+
+  final aiFuture = _aiService.sendTaskMessage(
+    _taskSystemPrompt,
+    prompt,
+    base64Image: base64Image,
+  );
         );
         // Race: whichever finishes first wins
         final result = await Future.any([
