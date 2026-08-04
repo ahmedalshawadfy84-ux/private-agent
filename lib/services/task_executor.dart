@@ -269,15 +269,14 @@ String response;
 try {
   _cancelCompleter = Completer<void>();
 
-  // التقاط لقطة الشاشة وإرسالها للـ AI
+  // التقاط لقطة الشاشة
   final String? base64Image = await _screenService.takeScreenshot();
 
   final aiFuture = _aiService.sendTaskMessage(
     _taskSystemPrompt,
     prompt,
     base64Image: base64Image,
-  );
-        );
+    );
         // Race: whichever finishes first wins
         final result = await Future.any([
           aiFuture.then((r) => r),
