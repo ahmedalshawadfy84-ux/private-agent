@@ -37,10 +37,10 @@ class TaskExecutor {
     required AppLauncherService appLauncher,
     required ShizukuService shizukuService,
     this.onProgress,
-  }) : _aiService = aiService,
-       _screenService = screenService,
-       _appLauncher = appLauncher,
-       _shizukuService = shizukuService;
+  })  : _aiService = aiService,
+        _screenService = screenService,
+        _appLauncher = appLauncher,
+        _shizukuService = shizukuService;
 
   /// Cancel the currently running task — takes effect immediately
   void cancel() {
@@ -87,14 +87,16 @@ Rules:
 
   /// Extract JSON safely even if wrapped in markdown or conversational text
   String _extractJson(String text) {
+    if (text.isEmpty) return '{}';
+    
     // 1. Try to find a markdown json code block
-    final codeBlockRegex = RegExp(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```');
+    final codeBlockRegex = RegExp(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', caseSensitive: false);
     final match = codeBlockRegex.firstMatch(text);
     if (match != null) {
       return match.group(1)!;
     }
 
-    // 2. Fallback: find the first { and the last }
+    // 2. Fallback: find the outer braces { and }
     final startIndex = text.indexOf('{');
     final endIndex = text.lastIndexOf('}');
     if (startIndex != -1 && endIndex != -1 && endIndex > startIndex) {
@@ -111,18 +113,13 @@ Rules:
     );
     _cancelled = false;
 
-    await ScreenAutomationService.logToNative(
-      "[TaskExecutor] Checking if accessibility service is running...",
-    );
     final isRunning = await _screenService.isServiceRunning();
     await ScreenAutomationService.logToNative(
       "[TaskExecutor] Accessibility service isRunning = $isRunning",
     );
+
     if (!isRunning) {
-      await ScreenAutomationService.logToNative(
-        "[TaskExecutor] Accessibility service not running, returning early.",
-      );
-      return 'Accessibility service is not enabled. Go to Settings \u2192 Accessibility \u2192 PrivateAgent Screen Control and enable it.';
+      return 'Accessibility service is not enabled. Go to Settings → Accessibility → PrivateAgent Screen Control and enable it.';
     }
 
     final results = <String>[];
@@ -172,7 +169,6 @@ Rules:
       _report('Using navigation shortcut...');
       for (final step in shortcut) {
         if (_cancelled) break;
-
         bool success = false;
         if (step.action == 'open_app') {
           final appName = step.params['app_name'] as String? ?? '';
@@ -184,7 +180,6 @@ Rules:
           success = await _screenService.clickByText(text);
           await Future.delayed(const Duration(milliseconds: 1500));
         }
-
         if (success) {
           executedSteps.add(step);
           lastAction = step.action;
@@ -193,8 +188,6 @@ Rules:
         }
       }
     } else {
-      // If no shortcut is used, and we are currently inside the PrivateAgent app,
-      // press Home so the AI doesn't see its own chat bubbles and get confused by the task text.
       final currentPkg = await _screenService.getCurrentPackage();
       if (currentPkg == 'com.orailnoor.privateagent') {
         _report('Moving to background...');
@@ -204,60 +197,39 @@ Rules:
     }
 
     for (int step = 0; step < _aiService.maxSteps; step++) {
-      // Check for cancellation
       if (_cancelled) {
-        results.add('Task cancelled by user.');
-        _report('Task cancelled.');
-        await _notificationService.showTaskCompleteNotification(
-          'Task Cancelled',
-          'Task was stopped by the user.',
-        );
-        await TaskHistoryLogger.logTask(
-          userGoal,
-          'Cancelled',
-          totalTokens,
-          step,
-          results,
-        );
-        await _screenService.showToast('Task Cancelled');
-        return 'Task cancelled.';
+        return await _handleCancellation(userGoal, totalTokens, step, results);
       }
 
-      // Adaptive delay: give Android apps time to transition screens, load data, or open keyboards
-      int delay = 1200; // Default 1.2s delay for most actions
+      int delay = 1200;
       if (lastAction == 'open_app') {
-        delay = 3000; // Apps need ~3 seconds to fully cold-start and render
+        delay = 3000;
       } else if (lastAction == 'type_text') {
-        delay =
-            2000; // Typing involves keyboards and often triggers heavy network requests (search)
+        delay = 2000;
       } else if (lastAction == 'click_text' || lastAction == 'click_at') {
-        delay = 1500; // Clicking usually triggers a screen transition
+        delay = 1500;
       } else if (lastAction == 'scroll') {
-        delay = 1000; // Scrolling is relatively fast
+        delay = 1000;
       }
       await Future.delayed(Duration(milliseconds: delay));
 
       // 1. Capture current screenshot as Base64 for Pure Vision mode
       final String? base64Image = await _screenService.takeScreenshot();
-
       developer.log(
         '=== CAPTURED SCREENSHOT (Step ${step + 1}) ===',
         name: 'PrivateAgent',
       );
 
-      // Determine previous result string
       final prevResultStr = step > 0 && results.isNotEmpty
           ? '\nPREVIOUS ACTION RESULT: ${results.last}\n'
           : '';
 
-      // Build failure hint if agent is stuck in a loop
       String failureHint = '';
       if (consecutiveFailures >= 3) {
         failureHint =
             '\n\nWARNING: You have failed $consecutiveFailures times in a row with the same approach. You MUST try a completely different action. Try click_at with visual coordinates. Do NOT repeat the same failed action.';
       }
 
-            // 2. Build the prompt for Pure Vision (system prompt is sent separately via sendTaskMessage)
       final prompt =
           '''TASK: $userGoal
 $prevResultStr$failureHint
@@ -265,7 +237,7 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
 
       developer.log('=== AI PROMPT ===\n$prompt', name: 'PrivateAgent');
 
-      // 3. Get AI response with image payload — races against cancel signal so Stop works immediately
+      // 2. Get AI response with image payload — races against cancel signal
       String response;
       try {
         _cancelCompleter = Completer<void>();
@@ -275,56 +247,25 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
           base64Image: base64Image,
         );
 
-        // Race: whichever finishes first wins
         final result = await Future.any([
           aiFuture.then((r) => r),
           _cancelCompleter!.future.then((_) => null),
         ]);
 
         if (result == null || _cancelled) {
-          results.add('Task cancelled by user.');
-          _report('Task cancelled.');
-          await _notificationService.showTaskCompleteNotification(
-            'Task Cancelled',
-            'Task was stopped by the user.',
-          );
-          await TaskHistoryLogger.logTask(
-            userGoal,
-            'Cancelled',
-            totalTokens,
-            step,
-            results,
-          );
-          await _screenService.showToast('Task Cancelled');
-          return 'Task cancelled.';
+          return await _handleCancellation(userGoal, totalTokens, step, results);
         }
 
         final aiResponse = result as AiResponse;
         response = aiResponse.content;
         totalTokens += aiResponse.totalTokens;
-
         developer.log(
           '=== RAW AI RESPONSE ===\n$response',
           name: 'PrivateAgent',
         );
       } catch (e) {
         if (_cancelled) {
-          results.add('Task cancelled by user.');
-          _report('Task cancelled.');
-          await _notificationService.showTaskCompleteNotification(
-            'Task Cancelled',
-            'Task was stopped by the user.',
-          );
-          await TaskHistoryLogger.logTask(
-            userGoal,
-            'Cancelled',
-            totalTokens,
-            step,
-            results,
-          );
-          await _screenService.showToast('Task Cancelled');
-          await Future.delayed(const Duration(seconds: 2));
-          return 'Task cancelled.';
+          return await _handleCancellation(userGoal, totalTokens, step, results);
         }
         results.add('AI error: $e');
         _report('Error: $e');
@@ -344,63 +285,35 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
         return 'I could not complete the task because the AI service failed.';
       }
 
-      // Check for cancellation after AI response
       if (_cancelled) {
-        results.add('Task cancelled by user.');
-        _report('Task cancelled.');
-        await _notificationService.showTaskCompleteNotification(
-          'Task Cancelled',
-          'Task was stopped by the user.',
-        );
-        await TaskHistoryLogger.logTask(
-          userGoal,
-          'Cancelled',
-          totalTokens,
-          step,
-          results,
-        );
-        await _screenService.showToast('Task Cancelled');
-        await Future.delayed(const Duration(seconds: 2));
-        return 'Task cancelled.';
+        return await _handleCancellation(userGoal, totalTokens, step, results);
       }
 
-      // 4. Parse the action (with one retry on failure)
+      // 3. Parse the action (with one retry on failure)
       Map<String, dynamic>? actionJson;
-      String? parsedJsonStr;
       try {
         String jsonStr = _extractJson(response);
-
         actionJson = jsonDecode(jsonStr) as Map<String, dynamic>;
-        parsedJsonStr = jsonStr;
       } catch (firstError) {
-        // First attempt failed — retry once
         developer.log(
           '=== JSON PARSE FAILED, RETRYING ===\nError: $firstError\nRaw: $response',
           name: 'PrivateAgent',
         );
-        _report('Retrying step ${step + 1}...\n(Failed to parse: $firstError)');
-        // Wait 2 seconds before retrying to prevent rate-limit spam
+        _report('Retrying step ${step + 1}...\n(Failed to parse response)');
         await Future.delayed(const Duration(seconds: 2));
+
         try {
           final retryResponse = await _aiService.sendTaskMessage(
             _taskSystemPrompt,
             prompt,
+            base64Image: base64Image,
           );
           totalTokens += retryResponse.totalTokens;
-          developer.log(
-            '=== RETRY AI RESPONSE ===\n${retryResponse.content}',
-            name: 'PrivateAgent',
-          );
-
           String jsonStr = _extractJson(retryResponse.content);
           actionJson = jsonDecode(jsonStr) as Map<String, dynamic>;
-          parsedJsonStr = jsonStr;
         } catch (e) {
           results.add('Step ${step + 1}: Error after retry: $e');
-
-          String debugInfo = 'Error: $e';
-          _report('AI Error: $debugInfo\n\nRaw output:\n${response}');
-
+          _report('AI Formatting Error: $e');
           await _notificationService.showTaskCompleteNotification(
             'Task Error',
             'AI formatting error.',
@@ -427,13 +340,13 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
         '=== PARSED ACTION ===\nAction: $action\nParams: $params\nReasoning: $reasoning\nIs Complete: $isComplete',
         name: 'PrivateAgent',
       );
-
       _report('Step ${step + 1}: $reasoning');
 
       sameActionCount = action == lastAction ? sameActionCount + 1 : 1;
       final repeatLimit = action == 'press_enter'
           ? 2
           : (action == 'scroll' || action == 'swipe' ? 3 : 1000);
+
       if (sameActionCount > repeatLimit) {
         final blockedResult =
             'Blocked repeated $action action. Use a different action on the visible screen.';
@@ -444,12 +357,11 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
         lastAction = action;
         continue;
       }
-      lastAction = action; // Track for adaptive delay
+      lastAction = action;
 
-      // 5. Execute the action
+      // 4. Execute the action
       bool success = false;
       String actionResult = '';
-
       switch (action) {
         case 'click_text':
           final text = params['text'] as String? ?? '';
@@ -458,38 +370,32 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
               ? 'Clicked "$text"'
               : 'Could not find "$text" to click';
           break;
-
         case 'click_at':
           final x = (params['x'] as num?)?.toDouble() ?? 0;
           final y = (params['y'] as num?)?.toDouble() ?? 0;
           success = await _screenService.clickAt(x, y);
           actionResult = success ? 'Clicked at ($x, $y)' : 'Click failed';
           break;
-
         case 'type_text':
           final text = params['text'] as String? ?? '';
           final hint = params['field_hint'] as String?;
           success = await _screenService.typeText(text, fieldHint: hint);
           actionResult = success ? 'Typed "$text"' : 'Could not type text';
           break;
-
         case 'press_enter':
           success = await _submitKeyboardAction();
           actionResult = success
               ? 'Submitted the focused search/form field'
               : 'Could not submit the focused field';
           break;
-
         case 'swipe':
           final startX = (params['startX'] as num?)?.toDouble() ?? 540;
           final startY = (params['startY'] as num?)?.toDouble() ?? 2000;
           final endX = (params['endX'] as num?)?.toDouble() ?? 540;
           final endY = (params['endY'] as num?)?.toDouble() ?? 500;
-
           success = await _performSwipe(startX, startY, endX, endY);
           actionResult = 'Swiped from ($startX,$startY) to ($endX,$endY)';
           break;
-
         case 'scroll':
           final direction = params['direction'] as String? ?? 'down';
           success = await _performScroll(direction);
@@ -497,29 +403,24 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
               ? 'Scrolled $direction'
               : 'Could not scroll $direction';
           break;
-
         case 'press_back':
           success = await _screenService.pressBack();
           actionResult = 'Pressed back';
           break;
-
         case 'press_home':
           success = await _screenService.pressHome();
           actionResult = 'Pressed home';
           break;
-
         case 'open_app':
           final appName = params['app_name'] as String? ?? '';
           actionResult = await _appLauncher.openApp(appName);
           success = actionResult.startsWith('Opened');
           break;
-
         case 'wait':
           await Future.delayed(const Duration(seconds: 1));
           actionResult = 'Waited';
           success = true;
           break;
-
         case 'done':
           results.add('Task complete: $reasoning');
           _report('Task complete: $reasoning');
@@ -529,7 +430,6 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
           );
           await _screenService.showToast('Task completed');
           return reasoning.trim().isEmpty ? 'Done.' : reasoning.trim();
-
         default:
           actionResult = 'Unknown action: $action';
       }
@@ -548,7 +448,6 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
           lastFailedAction = action;
         }
 
-        // If stuck for 5+ consecutive failures, give up on this task
         if (consecutiveFailures >= 5) {
           results.add(
             'Agent is stuck. Stopping task after $consecutiveFailures consecutive failures.',
@@ -572,7 +471,6 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
 
         final recovery = await _recoveryEngine.diagnose(action, base64Image ?? "");
         _report('Recovering: ${recovery.description}');
-
         if (recovery.action == 'wait') {
           await Future.delayed(const Duration(seconds: 2));
         } else if (recovery.action == 'press_back') {
@@ -591,7 +489,6 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
         } else if (recovery.action == 'press_home') {
           await _screenService.pressHome();
         }
-
         results.add('Recovery step: ${recovery.description}');
         continue;
       } else {
@@ -602,7 +499,6 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
 
       results.add('Step ${step + 1}: $actionResult ($reasoning)');
 
-      // Provide progress feedback
       if (!isComplete && (step + 1) % 3 == 0) {
         await _screenService.showToast('Working... (Step ${step + 1})');
       }
@@ -621,12 +517,8 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
           step,
           results,
         );
-
-        // Save to skill memory
         await _skillMemory.saveSkill(userGoal, executedSteps);
-
         await _screenService.showToast('Task Complete!');
-        // Wait 4 seconds so the user can see the result before jumping back
         await Future.delayed(const Duration(seconds: 4));
         return reasoning.trim().isEmpty ? 'Done.' : reasoning.trim();
       }
@@ -649,8 +541,30 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
     );
     await _screenService.showToast('Reached maximum steps.');
     await Future.delayed(const Duration(seconds: 4));
-
     return 'I could not complete the task within the allowed steps.';
+  }
+
+  Future<String> _handleCancellation(
+    String userGoal,
+    int totalTokens,
+    int step,
+    List<String> results,
+  ) async {
+    results.add('Task cancelled by user.');
+    _report('Task cancelled.');
+    await _notificationService.showTaskCompleteNotification(
+      'Task Cancelled',
+      'Task was stopped by the user.',
+    );
+    await TaskHistoryLogger.logTask(
+      userGoal,
+      'Cancelled',
+      totalTokens,
+      step,
+      results,
+    );
+    await _screenService.showToast('Task Cancelled');
+    return 'Task cancelled.';
   }
 
   void _report(String message) {
@@ -659,10 +573,8 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
 
   Future<bool> _submitKeyboardAction() async {
     if (await _screenService.pressEnter()) return true;
-
     final shizukuAvailable = await _shizukuService.checkAvailability();
     if (!shizukuAvailable) return false;
-
     final result = await _shizukuService.runCommand('input keyevent 66');
     final normalized = result.toLowerCase();
     return !normalized.contains('not running') &&
@@ -672,7 +584,6 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
 
   Future<bool> _performScroll(String direction) async {
     if (await _screenService.scroll(direction)) return true;
-
     final isDown = direction.toLowerCase() == 'down';
     return _performSwipe(540, isDown ? 1800 : 600, 540, isDown ? 600 : 1800);
   }
@@ -684,10 +595,8 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
     double endY,
   ) async {
     if (await _screenService.swipe(startX, startY, endX, endY)) return true;
-
     final shizukuAvailable = await _shizukuService.checkAvailability();
     if (!shizukuAvailable) return false;
-
     final result = await _shizukuService.runCommand(
       'input swipe ${startX.toInt()} ${startY.toInt()} '
       '${endX.toInt()} ${endY.toInt()} 600',
@@ -702,26 +611,19 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
   Future<bool> _replaySkill(SavedSkill skill, List<String> results) async {
     for (int i = 0; i < skill.steps.length; i++) {
       if (_cancelled) return false;
-
       final step = skill.steps[i];
       _report('Replaying step ${i + 1}/${skill.steps.length}: ${step.action}');
 
-      // Delay before executing each step
       int delay = 1200;
-      if (step.action == 'open_app')
-        delay = 3000;
-      else if (step.action == 'type_text')
-        delay = 2000;
-      else if (step.action == 'click_text' || step.action == 'click_at')
-        delay = 1500;
-      else if (step.action == 'scroll')
-        delay = 1000;
+      if (step.action == 'open_app') delay = 3000;
+      else if (step.action == 'type_text') delay = 2000;
+      else if (step.action == 'click_text' || step.action == 'click_at') delay = 1500;
+      else if (step.action == 'scroll') delay = 1000;
 
       await Future.delayed(Duration(milliseconds: delay));
 
       bool success = false;
       String actionResult = '';
-
       switch (step.action) {
         case 'click_text':
           final text = step.params['text'] as String? ?? '';
@@ -795,19 +697,16 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
         '=== MEMORY REPLAY RESULT ===\n$actionResult',
         name: 'PrivateAgent',
       );
-
       if (!success) {
-        return false; // Break out of replay if a step fails
+        return false;
       }
     }
-
-    return true; // All steps succeeded
+    return true;
   }
 
   /// Returns predefined navigation steps for common tasks
   List<ActionStep>? _getNavigationShortcut(String goal) {
     final lower = goal.toLowerCase();
-
     if (lower.contains('dark mode') || lower.contains('dark theme')) {
       return [
         ActionStep(action: 'open_app', params: {'app_name': 'Settings'}),
@@ -862,7 +761,6 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
       }
     }
 
-    // Generic fallback for "open X"
     final openMatch = RegExp(r'^open\s+([a-zA-Z0-9]+)').firstMatch(lower);
     if (openMatch != null) {
       String app = openMatch.group(1)!;
