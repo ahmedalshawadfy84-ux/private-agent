@@ -84,7 +84,6 @@ Rules:
 - If stuck after 3 repeated identical attempts, set is_complete=true and explain in reasoning.
 - Keep reasoning very brief (1 sentence)
 ''';
-''';
 
   /// Extract JSON safely even if wrapped in markdown or conversational text
   String _extractJson(String text) {
@@ -238,12 +237,10 @@ Rules:
       }
       await Future.delayed(Duration(milliseconds: delay));
 
-      // 1. Read the current screen text
-      final screenContent = _aiService.useScreenCompression
-          ? await _screenService.getCompressedScreenDescription(userGoal)
-          : await _screenService.getScreenDescription();
+      // 1. Capture current screenshot as Base64 for Pure Vision mode
+      final String? base64Image = await _screenService.takeScreenshotBase64();
       developer.log(
-        '=== SCREEN DUMP (Step ${step + 1}) ===\n$screenContent',
+        '=== CAPTURED SCREENSHOT (Step ${step + 1}) ===',
         name: 'PrivateAgent',
       );
 
@@ -256,10 +253,10 @@ Rules:
       String failureHint = '';
       if (consecutiveFailures >= 3) {
         failureHint =
-            '\n\nWARNING: You have failed $consecutiveFailures times in a row with the same approach. You MUST try a completely different action. If open_app failed, try press_home and look for the app icon on the home screen instead. If click_text failed, use click_at with coordinates. Do NOT repeat the same failed action.';
+            '\n\nWARNING: You have failed $consecutiveFailures times in a row with the same approach. You MUST try a completely different action. Try click_at with visual coordinates. Do NOT repeat the same failed action.';
       }
 
-      // 2. Build the prompt for Pure Vision (system prompt is sent separately via sendTaskMessage)
+            // 2. Build the prompt for Pure Vision (system prompt is sent separately via sendTaskMessage)
       final prompt =
           '''TASK: $userGoal
 $prevResultStr$failureHint
@@ -268,18 +265,15 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the attached screenshot image a
       developer.log('=== AI PROMPT ===\n$prompt', name: 'PrivateAgent');
 
       // 3. Get AI response with image payload — races against cancel signal so Stop works immediately
-String response;
-try {
-  _cancelCompleter = Completer<void>();
+      String response;
+      try {
+        _cancelCompleter = Completer<void>();
+        final aiFuture = _aiService.sendTaskMessage(
+          _taskSystemPrompt,
+          prompt,
+          base64Image: base64Image,
+        );
 
-  // التقاط لقطة الشاشة
-  final String? base64Image = await _screenService.takeScreenshot();
-
-  final aiFuture = _aiService.sendTaskMessage(
-    _taskSystemPrompt,
-    prompt,
-    base64Image: base64Image,
-    );
         // Race: whichever finishes first wins
         final result = await Future.any([
           aiFuture.then((r) => r),
@@ -465,12 +459,11 @@ try {
           break;
 
         case 'click_at':
-case 'tap':
-  final x = (params['x'] as num?)?.toDouble() ?? 0;
-  final y = (params['y'] as num?)?.toDouble() ?? 0;
-  success = await _screenService.clickAt(x, y);
-  actionResult = success ? 'Clicked at ($x, $y)' : 'Click failed';
-  break;
+          final x = (params['x'] as num?)?.toDouble() ?? 0;
+          final y = (params['y'] as num?)?.toDouble() ?? 0;
+          success = await _screenService.clickAt(x, y);
+          actionResult = success ? 'Clicked at ($x, $y)' : 'Click failed';
+          break;
 
         case 'type_text':
           final text = params['text'] as String? ?? '';
