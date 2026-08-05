@@ -16,8 +16,8 @@ class TaskExecutor {
   final ShizukuService _shizukuService;
   final NotificationService _notificationService = NotificationService();
   final RecoveryEngine _recoveryEngine = RecoveryEngine();
-
   final void Function(String message)? onProgress;
+
   bool _cancelled = false;
   Completer<void>? _cancelCompleter;
 
@@ -39,16 +39,16 @@ class TaskExecutor {
     }
   }
 
-  // System Prompt مخصص لألعاب Unity والرؤية البصرية
+  // System Prompt مخصص لألعاب Unity والرؤية البصرية والتطبيقات
   static const String _unityTaskSystemPrompt = '''
 You are a visual mobile gaming and application automation agent.
 You are provided with a visual SCREENSHOT of a mobile app or game (Unity/Vulkan/OpenGL canvas).
 
-IMPORTANT FOR GAMES:
-1. Game UIs do NOT expose readable text accessibility nodes. You MUST analyze the image visually.
+IMPORTANT RULES:
+1. Game/App UIs may NOT expose readable text accessibility nodes. You MUST analyze the image visually.
 2. ALWAYS use `click_at` with exact (x, y) visual screen coordinates based on the pixel layout of the provided screenshot.
-3. DO NOT rely on `click_text` for inside-game UI buttons. Use visual coordinates (`click_at`).
-4. For drag-and-drop or puzzle movements, use `swipe` with precise start and end coordinates.
+3. For drag-and-drop or puzzle movements, use `swipe` with precise start and end coordinates.
+4. CRITICAL: If the user request contains multiple actions (e.g. "open app AND search/type/click"), NEVER set "is_complete": true on an `open_app` action. Set "is_complete": false so you can process the newly opened screen in the next step.
 
 Respond with ONLY a JSON object (no markdown, no code fences):
 {
@@ -84,25 +84,23 @@ Available actions:
 
   Future<String> executeTask(String userGoal) async {
     _cancelled = false;
-
     final isRunning = await _screenService.isServiceRunning();
     if (!isRunning) {
       return 'Accessibility service is not enabled.';
     }
 
-    final results = <String>[];
-    _report('Starting Unity/Visual Task: $userGoal');
-
+    _report('Starting Visual Task: $userGoal');
     String lastAction = '';
     int totalTokens = 0;
 
     for (int step = 0; step < _aiService.maxSteps; step++) {
       if (_cancelled) return 'Task cancelled by user.';
 
-      // إعطاء وقت كافٍ للعبة للتحريك وتنفيذ الرسومات (Game Rendering Delay)
+      // إعطاء وقت كافٍ للعبة أو التطبيق للتحريك وتنفيذ الرسم
       int delay = 1500;
       if (lastAction == 'open_app') delay = 4000;
       else if (lastAction == 'swipe') delay = 2000;
+
       await Future.delayed(Duration(milliseconds: delay));
 
       // التقاط الشاشة البصرية كصورة (Screenshot)
@@ -114,12 +112,11 @@ Available actions:
       }
 
       final prompt = '''TASK: $userGoal
-Step ${step + 1}/${_aiService.maxSteps}. Analyze the visual screenshot image carefully. Determine the exact coordinates (x, y) to click or swipe next.''';
+Step ${step + 1}/${_aiService.maxSteps}. Analyze the visual screenshot image carefully. Determine the exact coordinates (x, y) to click, text to type, or swipe next.''';
 
       String response;
       try {
         _cancelCompleter = Completer<void>();
-        // إرسال لقطة الشاشة كمُدخل بصري للنموذج (Multimodal Vision Request)
         final aiFuture = _aiService.sendTaskMessage(
           _unityTaskSystemPrompt, 
           prompt, 
@@ -132,7 +129,6 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the visual screenshot image car
         ]);
 
         if (result == null || _cancelled) return 'Task cancelled.';
-
         final aiResponse = result as AiResponse;
         response = aiResponse.content;
         totalTokens += aiResponse.totalTokens;
@@ -150,45 +146,49 @@ Step ${step + 1}/${_aiService.maxSteps}. Analyze the visual screenshot image car
       final action = actionJson['action'] as String? ?? 'wait';
       final params = actionJson['params'] as Map<String, dynamic>? ?? {};
       final reasoning = actionJson['reasoning'] as String? ?? '';
-      final isComplete = actionJson['is_complete'] == true;
+      bool isComplete = actionJson['is_complete'] == true;
 
       _report('Step ${step + 1}: $reasoning');
       lastAction = action;
 
-      bool success = false;
       switch (action) {
         case 'click_at':
           final x = (params['x'] as num?)?.toDouble() ?? 0;
           final y = (params['y'] as num?)?.toDouble() ?? 0;
-          success = await _screenService.clickAt(x, y);
+          await _screenService.clickAt(x, y);
           break;
+
         case 'swipe':
           final startX = (params['startX'] as num?)?.toDouble() ?? 540;
           final startY = (params['startY'] as num?)?.toDouble() ?? 1000;
           final endX = (params['endX'] as num?)?.toDouble() ?? 540;
           final endY = (params['endY'] as num?)?.toDouble() ?? 500;
-          success = await _performSwipe(startX, startY, endX, endY);
+          await _performSwipe(startX, startY, endX, endY);
           break;
+
         case 'type_text':
           final text = params['text'] as String? ?? '';
-          success = await _screenService.typeText(text);
+          await _screenService.typeText(text);
           break;
+
         case 'open_app':
           final appName = params['app_name'] as String? ?? '';
-          final res = await _appLauncher.openApp(appName);
-          success = res.startsWith('Opened');
+          await _appLauncher.openApp(appName);
+          // تجاهل إشارة إكمال المهمة المبكرة فور فتح التطبيق لاستكمال باقي الأوامر
+          isComplete = false; 
           break;
+
         case 'wait':
           await Future.delayed(const Duration(seconds: 2));
-          success = true;
           break;
+
         case 'done':
-          await _notificationService.showTaskCompleteNotification('Game Task Complete', reasoning);
+          await _notificationService.showTaskCompleteNotification('Task Complete', reasoning);
           return reasoning;
       }
 
-      if (isComplete) {
-        await _notificationService.showTaskCompleteNotification('Game Task Complete', reasoning);
+      if (isComplete && action != 'open_app') {
+        await _notificationService.showTaskCompleteNotification('Task Complete', reasoning);
         return reasoning;
       }
     }
