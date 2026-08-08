@@ -22,7 +22,6 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-
         EventChannel(flutterEngine.dartExecutor.binaryMessenger, EVENT_CHANNEL).setStreamHandler(
             object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
@@ -33,15 +32,14 @@ class MainActivity : FlutterActivity() {
                         }
                     }
                 }
-
                 override fun onCancel(arguments: Any?) {
                     eventSink = null
                     AgentAccessibilityService.eventListener = null
                 }
             }
         )
-
         registerAccessibilityChannel(flutterEngine, this)
+        ScreenProjectionBridge.attach(flutterEngine, this)
     }
 
     companion object {
@@ -51,44 +49,36 @@ class MainActivity : FlutterActivity() {
                     android.util.Log.d("PrivateAgentKotlin", "Received method call: ${call.method}")
                     when (call.method) {
                         "ping" -> result.success(true)
-
                         "logToNative" -> {
                             val msg = call.argument<String>("message") ?: ""
                             android.util.Log.d("PrivateAgentDart", msg)
                             result.success(true)
                         }
-
                         "isServiceRunning" -> {
                             result.success(AgentAccessibilityService.isRunning())
                         }
-
                         "checkOverlayPermission" -> {
                             result.success(Settings.canDrawOverlays(context))
                         }
-
                         "requestOverlayPermission" -> {
                             val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}"))
                             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                             context.startActivity(intent)
                             result.success(true)
                         }
-
                         "showMacroOverlay" -> {
                             // Macro overlay requires an Activity context, so we just ignore or return error if called from background
                             result.error("NOT_SUPPORTED", "Macro overlay not supported from background", null)
                         }
-
                         "hideMacroOverlay" -> {
                             result.success(true)
                         }
-
                         "openAccessibilitySettings" -> {
                             val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
                             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                             context.startActivity(intent)
                             result.success(true)
                         }
-
                         "dumpScreen" -> {
                             val service = AgentAccessibilityService.instance
                             if (service == null) {
@@ -98,7 +88,6 @@ class MainActivity : FlutterActivity() {
                                 result.success(nodes)
                             }
                         }
-
                         "takeScreenshot" -> {
                             val service = AgentAccessibilityService.instance
                             if (service == null) {
@@ -106,8 +95,8 @@ class MainActivity : FlutterActivity() {
                             } else {
                                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
                                     service.takeScreenshot { base64 ->
-                                        if (base64 != null) {
-                                            result.success(base64)
+ if (base64 != null) {
+ result.success(base64)
                                         } else {
                                             result.error("SCREENSHOT_FAILED", "Failed to capture screenshot", null)
                                         }
@@ -117,7 +106,6 @@ class MainActivity : FlutterActivity() {
                                 }
                             }
                         }
-
                         "clickByText" -> {
                             val text = call.argument<String>("text") ?: ""
                             val service = AgentAccessibilityService.instance
@@ -127,7 +115,6 @@ class MainActivity : FlutterActivity() {
                                 result.success(service.clickByText(text))
                             }
                         }
-
                         "clickAt" -> {
                             val x = call.argument<Double>("x")?.toFloat() ?: 0f
                             val y = call.argument<Double>("y")?.toFloat() ?: 0f
@@ -138,7 +125,6 @@ class MainActivity : FlutterActivity() {
                                 result.success(service.clickAtCoordinates(x, y))
                             }
                         }
-
                         "typeText" -> {
                             val text = call.argument<String>("text") ?: ""
                             val hint = call.argument<String>("fieldHint")
@@ -149,7 +135,6 @@ class MainActivity : FlutterActivity() {
                                 result.success(service.typeText(text, hint))
                             }
                         }
-
                         "pressEnter" -> {
                             val service = AgentAccessibilityService.instance
                             if (service == null) {
@@ -158,7 +143,6 @@ class MainActivity : FlutterActivity() {
                                 result.success(service.pressEnter())
                             }
                         }
-
                         "scroll" -> {
                             val direction = call.argument<String>("direction") ?: "down"
                             val target = call.argument<String>("target")
@@ -169,13 +153,11 @@ class MainActivity : FlutterActivity() {
                                 result.success(service.scroll(direction, target))
                             }
                         }
-
                         "showToast" -> {
                             val message = call.argument<String>("message") ?: ""
                             android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_SHORT).show()
                             result.success(true)
                         }
-
                         "swipe" -> {
                             val startX = call.argument<Double>("startX")?.toFloat() ?: 0f
                             val startY = call.argument<Double>("startY")?.toFloat() ?: 0f
@@ -188,7 +170,6 @@ class MainActivity : FlutterActivity() {
                                 result.success(service.swipe(startX, startY, endX, endY))
                             }
                         }
-
                         "pressBack" -> {
                             val service = AgentAccessibilityService.instance
                             if (service == null) {
@@ -197,7 +178,6 @@ class MainActivity : FlutterActivity() {
                                 result.success(service.pressBack())
                             }
                         }
-
                         "pressHome" -> {
                             val service = AgentAccessibilityService.instance
                             if (service == null) {
@@ -206,7 +186,6 @@ class MainActivity : FlutterActivity() {
                                 result.success(service.pressHome())
                             }
                         }
-
                         "openNotifications" -> {
                             val service = AgentAccessibilityService.instance
                             if (service == null) {
@@ -215,7 +194,6 @@ class MainActivity : FlutterActivity() {
                                 result.success(service.openNotifications())
                             }
                         }
-
                         "getCurrentPackage" -> {
                             val service = AgentAccessibilityService.instance
                             if (service == null) {
@@ -224,7 +202,6 @@ class MainActivity : FlutterActivity() {
                                 result.success(service.getCurrentPackage())
                             }
                         }
-
                         else -> result.notImplemented()
                     }
                 }
@@ -241,7 +218,6 @@ class BackgroundEngineReceiver : android.content.BroadcastReceiver() {
             android.util.Log.e("PrivateAgent", "Background engine myCachedEngine was not found")
             return
         }
-
         android.util.Log.d(
             "PrivateAgent",
             "Registering accessibility channel on myCachedEngine " +
