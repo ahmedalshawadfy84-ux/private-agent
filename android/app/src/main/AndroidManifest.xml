@@ -1,6 +1,5 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
-
     <!-- Permissions -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
@@ -17,7 +16,7 @@
         android:name="android.permission.SYSTEM_ALERT_WINDOW"
         tools:node="remove" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <!-- For speech recognition -->
     <queries>
         <intent>
@@ -43,12 +42,10 @@
             <data android:scheme="mailto" />
         </intent>
     </queries>
-
     <application
         android:label="PrivateAgent"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
-
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -67,15 +64,12 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
-
         <receiver android:name=".BackgroundEngineReceiver" android:exported="true">
             <intent-filter>
                 <action android:name="com.orailnoor.privateagent.REGISTER_BACKGROUND_CHANNELS" />
             </intent-filter>
         </receiver>
-
         <!-- Provide required meta-data for flutter -->
-
         <!-- Shizuku provider (optional - only works when Shizuku is installed) -->
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
@@ -84,7 +78,6 @@
             android:enabled="true"
             android:exported="true"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
-
         <!-- Accessibility Service for screen reading and UI automation -->
         <service
             android:name=".AgentAccessibilityService"
@@ -98,7 +91,19 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
         </service>
-
+        <!-- MediaProjection foreground service for live screen capture -->
+        <service
+            android:name=".ScreenCaptureService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection"
+            android:label="PrivateAgent Screen Capture" />
+        <!-- Tiny transparent Activity used to obtain MediaProjection consent. -->
+        <activity
+            android:name=".PendingConsentActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:taskAffinity="" />
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
