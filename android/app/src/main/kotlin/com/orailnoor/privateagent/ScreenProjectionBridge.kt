@@ -107,7 +107,9 @@ object ScreenProjectionBridge {
  */
 class PendingConsentActivity : Activity() {
     companion object {
-        private const val REQUEST_CODE = 0x5050        fun start(context: Context, intent: Intent) {
+        private const val REQUEST_CODE = 0x5050
+
+        fun start(context: Context, intent: Intent) {
             val launch = Intent(context, PendingConsentActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
