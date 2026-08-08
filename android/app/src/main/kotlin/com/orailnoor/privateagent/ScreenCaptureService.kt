@@ -27,11 +27,7 @@ import java.io.ByteArrayOutputStream
 /**
  * Foreground service that owns the live [MediaProjection] session for
  * PrivateAgent. It captures the screen while a multi-step task is running
- * and keeps the privacy indicator (green dot) visible at the top-left.
- *
- * The service is intended to live for the entire duration of a task. The
- * agent MUST only stop the service after a task finishes, encounters an
- * unrecoverable error, or the user manually cancels the execution.
+ * and keeps the privacy indicator visible while capture is active.
  */
 class ScreenCaptureService : Service() {
     companion object {
@@ -47,7 +43,7 @@ class ScreenCaptureService : Service() {
         @Volatile
         private var active: ScreenCaptureService? = null
 
-        fun isRunning(): Boolean = active != null
+        fun isRunning(): Boolean = active?.projection != null
         fun latestFrame(): String? = active?.latestFrameBase64
 
         fun stop(context: Context, reason: String) {
@@ -63,8 +59,7 @@ class ScreenCaptureService : Service() {
                 }
             } catch (e: Throwable) {
                 Log.w(TAG, "Failed to deliver stop intent: ${e.message}")
-                // Fall back to direct teardown if the service is not reachable.
-                active?.stopProjection()
+                active?.stopProjectionFromApp()
                 active?.stopForegroundCompat()
                 active?.stopSelf()
             }
@@ -88,7 +83,7 @@ class ScreenCaptureService : Service() {
     override fun onCreate() {
         super.onCreate()
         active = this
-        ensureChannel()
+        ensureNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -96,12 +91,13 @@ class ScreenCaptureService : Service() {
             ACTION_STOP -> {
                 val reason = intent.getStringExtra("reason") ?: "cancelled"
                 Log.d(TAG, "Stop requested: $reason")
-                stopProjection()
+                stopProjectionFromApp()
                 stopForegroundCompat()
                 stopSelf()
                 notifyFlutter("stopped", reason)
                 return START_NOT_STICKY
             }
+
             ACTION_START -> {
                 val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
                 val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -112,18 +108,25 @@ class ScreenCaptureService : Service() {
                 }
                 if (resultCode == 0 || resultData == null) {
                     Log.e(TAG, "Missing MediaProjection consent")
-                    stopForegroundCompat()
                     stopSelf()
                     notifyFlutter("error", "Missing consent payload")
                     return START_NOT_STICKY
                 }
-                startProjection(resultCode, resultData)
+
+                try {
+                    startProjection(resultCode, resultData)
+                } catch (e: Throwable) {
+                    Log.e(TAG, "Failed to start MediaProjection: ${e.message}", e)
+                    notifyFlutter("error", e.message ?: "Failed to start MediaProjection")
+                    stopProjectionFromApp()
+                    stopForegroundCompat()
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
             }
+
             else -> {
-                // Service restarted by the system (START_REDELIVER_INTENT).
-                // Do not auto-resume without consent — fail fast and stop.
                 Log.w(TAG, "Unknown intent action; stopping")
-                stopForegroundCompat()
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -132,12 +135,12 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onDestroy() {
-        super.onDestroy()
-        stopProjection()
+        stopProjectionFromApp()
         active = null
+        super.onDestroy()
     }
 
-    private fun ensureChannel() {
+    private fun ensureNotificationChannel() {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         if (nm.getNotificationChannel(CHANNEL_ID) == null) {
             val channel = NotificationChannel(
@@ -149,13 +152,20 @@ class ScreenCaptureService : Service() {
             channel.setShowBadge(false)
             nm.createNotificationChannel(channel)
         }
-        val builder = Notification.Builder(this, CHANNEL_ID)
+    }
+
+    private fun buildNotification(): Notification {
+        return Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("PrivateAgent")
             .setContentText("Screen sharing is active while the task is running")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setOngoing(true)
             .setCategory(Notification.CATEGORY_SERVICE)
-        val notification = builder.build()
+            .build()
+    }
+
+    private fun startForegroundCompat() {
+        val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 NOTIFICATION_ID,
@@ -172,6 +182,7 @@ class ScreenCaptureService : Service() {
             Log.d(TAG, "Projection already active; ignoring duplicate start")
             return
         }
+
         val metrics = DisplayMetrics()
         val display: Display? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             display
@@ -189,20 +200,25 @@ class ScreenCaptureService : Service() {
         val mediaProjection = projectionManager.getMediaProjection(resultCode, data)
         if (mediaProjection == null) {
             Log.e(TAG, "MediaProjection was null after consent")
-            stopForegroundCompat()
             stopSelf()
             notifyFlutter("error", "MediaProjection unavailable")
             return
         }
+
+        projection = mediaProjection
         mediaProjection.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() {
                 Log.d(TAG, "MediaProjection callback onStop fired")
-                stopProjection()
+                releaseProjectionResources()
                 stopForegroundCompat()
                 stopSelf()
                 notifyFlutter("stopped", "MediaProjection ended by the system")
             }
         }, mainHandler)
+
+        // Important on Android 14/15: call startForeground only after the
+        // MediaProjection consent has been consumed with getMediaProjection().
+        startForegroundCompat()
 
         val reader = ImageReader.newInstance(width, height, 0x1, 2)
         val callback = ImageReader.OnImageAvailableListener { r ->
@@ -251,28 +267,41 @@ class ScreenCaptureService : Service() {
             null,
             null,
         )
-        this.projection = mediaProjection
         this.virtualDisplay = virtualDisplay
         this.imageReader = reader
         Log.d(TAG, "MediaProjection started (${width}x$height @$density dpi)")
         notifyFlutter("started", "MediaProjection active")
     }
 
-    private fun stopProjection() {
+    private fun stopProjectionFromApp() {
+        val mediaProjection = projection
+        releaseProjectionResources()
+        try {
+            mediaProjection?.stop()
+        } catch (e: Throwable) {
+            Log.w(TAG, "Failed to stop MediaProjection cleanly: ${e.message}")
+        }
+    }
+
+    private fun releaseProjectionResources() {
         virtualDisplay?.release()
         virtualDisplay = null
         imageReader?.close()
         imageReader = null
-        projection?.stop()
         projection = null
+        latestFrameBase64 = null
     }
 
     private fun stopForegroundCompat() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-        } else {
-            @Suppress("DEPRECATION")
-            stopForeground(true)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Failed to stop foreground state: ${e.message}")
         }
     }
 
