@@ -349,7 +349,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       setState(() {
         _isLoading = false;
         _messages.add(
-          const ChatMessage(
+          ChatMessage(
             role: 'assistant',
             content: 'Task was stopped manually. The screen stream has been closed.',
           ),
