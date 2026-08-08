@@ -32,20 +32,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final VoiceService _voiceService = VoiceService();
   final NotificationService _notificationService = NotificationService();
   late final TelegramService _telegramService;
-
   final List<ChatMessage> _messages = [];
   bool _isLoading = false;
   bool _isListening = false;
-
   // Custom switch state: 'chat' or 'agent'
   String _mode = 'chat';
-
   // Chat Session state tracking
   String _sessionId = DateTime.now().millisecondsSinceEpoch.toString();
   String _sessionTitle = '';
-
   AppLifecycleState _appLifecycleState = AppLifecycleState.resumed;
   Timer? _overlayHistoryTimer;
+  bool _taskCancelNotified = false;
 
   @override
   void initState() {
@@ -64,7 +61,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await _voiceService.init();
     await _telegramService.init();
     await _actionHandler.shizuku.checkAvailability();
-
     if (mounted) {
       setState(() {});
     }
@@ -72,48 +68,42 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _saveSession() async {
     if (_messages.isEmpty) return;
-
     // Set first user message as session title if not set
     if (_sessionTitle.isEmpty) {
       final firstUserMsg = _messages.firstWhere(
         (m) => m.isUser,
         orElse: () => ChatMessage(role: 'user', content: 'New Chat'),
       );
-      _sessionTitle = firstUserMsg.content.length > 28
-          ? '${firstUserMsg.content.substring(0, 25)}...'
+      _sessionTitle = firstUserMsg.content.length > 28 ? '${firstUserMsg.content.substring(0, 25)}...'
           : firstUserMsg.content;
     }
-
     final session = ChatSession(
       id: _sessionId,
       title: _sessionTitle,
       timestamp: DateTime.now(),
       messages: _messages.map((m) => m.toJson()).toList(),
     );
-
     await ChatHistoryService.saveSession(session);
   }
 
   Future<void> _sendMessage(String text) async {
     if (text.trim().isEmpty) return;
-
     final userMessage = ChatMessage(role: 'user', content: text.trim());
     setState(() {
       _messages.add(userMessage);
       _isLoading = true;
+      _taskCancelNotified = false;
     });
     _updateOverlayState();
     _textController.clear();
     _scrollToBottom();
     await _saveSession();
-
     // Add empty placeholder assistant message for streaming
     final assistantMessage = ChatMessage(role: 'assistant', content: '');
     setState(() {
       _messages.add(assistantMessage);
     });
     final assistantIndex = _messages.length - 1;
-
     try {
       final isAgent = _mode == 'agent';
       final stream = _aiService
@@ -129,8 +119,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               sink.close();
             },
           );
-      String accumulated = '';
 
+      String accumulated = '';
       await for (final chunk in stream) {
         accumulated += chunk;
         if (mounted) {
@@ -144,57 +134,66 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         }
       }
       await _saveSession();
-
       // Check if it's an action
       final action = _aiService.parseAction(accumulated);
-
       if (action != null) {
         // If it's an action, we remove the raw JSON message from display
         setState(() {
           _messages.removeAt(assistantIndex);
         });
-
         await _showTaskProgressOverlay('Starting: ${text.trim()}');
-
         // Execute the action (pass aiService for multi-step tasks)
         final result = await _actionHandler.execute(
           action,
           aiService: _aiService,
           onProgress: (msg) {
+            // Silent execution: do not spam the chat. Progress is only
+            // forwarded to the floating overlay (if visible) and to logs.
             developer.log('Task progress: $msg', name: 'PrivateAgent');
             _sendOverlayEvent('OVERLAY_PROGRESS', msg);
+          },
+          onStatus: (msg) {
+            // Lifecycle messages (success, unrecoverable error, cancellation,
+            // service stop). Surface ONE clear message to the user.
+            developer.log('Task status: $msg', name: 'PrivateAgent');
+            _sendOverlayEvent('OVERLAY_TASK_FINISHED', msg);
             if (mounted) {
               setState(() {
                 _messages.add(
-                  ChatMessage(role: 'assistant', content: '⏳ $msg'),
+                  ChatMessage(role: 'assistant', content: msg),
                 );
               });
               _scrollToBottom();
             }
           },
         );
-
-        setState(() {
-          _messages.add(
-            ChatMessage(
-              role: 'assistant',
-              content: result.success
-                  ? (action.response.isNotEmpty
+        // For execute_task the onStatus callback already added a single
+        // terminal message. Skip the post-execute summary to avoid duplicates.
+        if (action.action == 'execute_task') {
+          _taskCancelNotified = false;
+        } else {
+          setState(() {
+            _messages.add(
+              ChatMessage(
+                role: 'assistant',
+                content: result.success
+                    ? (action.response.isNotEmpty
                         ? action.response
                         : (result.details ?? 'Done.'))
-                  : (action.response.isNotEmpty
+                    : (action.response.isNotEmpty
                         ? '${action.response}\n\n⚠️ ${result.details}'
                         : '⚠️ ${result.details}'),
-              actionResult: result,
-            ),
+                actionResult: result,
+              ),
+            );
+          });
+          _sendOverlayEvent(
+            'OVERLAY_TASK_FINISHED',
+            result.success
+                ? (result.details ?? 'Task complete.')
+                : 'Task failed: ${result.details ?? 'Unknown error'}',
           );
-        });
-        _sendOverlayEvent(
-          'OVERLAY_TASK_FINISHED',
-          result.success
-              ? (result.details ?? 'Task complete.')
-              : 'Task failed: ${result.details ?? 'Unknown error'}',
-        );
+        }
         if (action.action != 'execute_task') {
           await _notificationService.showTaskCompleteNotification(
             result.success ? 'Task Completed' : 'Task Failed',
@@ -237,11 +236,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _showTaskProgressOverlay(String message) async {
     if (!FeatureFlags.floatingOverlayEnabled) return;
     if (!await FlutterOverlayWindow.isPermissionGranted()) return;
-
     // Never cover PrivateAgent itself. The lifecycle observer will create the
     // overlay after an automated action moves this app to the background.
     if (_appLifecycleState != AppLifecycleState.paused) return;
-
     if (!await FlutterOverlayWindow.isActive()) {
       await FlutterOverlayWindow.showOverlay(
         enableDrag: true,
@@ -257,7 +254,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       );
       await Future<void>.delayed(const Duration(milliseconds: 300));
     }
-
     // Keep the overlay minimized during automation. The user can still tap the
     // bubble to open the full conversation whenever they choose.
     _sendOverlayEvent('OVERLAY_TASK_STARTED', message);
@@ -305,9 +301,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       setState(() => _isListening = false);
       return;
     }
-
     setState(() => _isListening = true);
-
     await _voiceService.startListening(
       onResult: (text) {
         _sendMessage(text);
@@ -337,7 +331,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       for (final m in session.messages) {
         _messages.add(ChatMessage.fromJson(m));
       }
-
       _aiService.clearHistory();
       for (final m in _messages) {
         if (m.actionResult != null) continue;
@@ -345,6 +338,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
     });
     _scrollToBottom();
+  }
+
+  Future<void> _cancelRunningTask() async {
+    if (_taskCancelNotified) return;
+    _taskCancelNotified = true;
+    await _actionHandler.cancelTask();
+    _sendOverlayEvent('OVERLAY_TASK_FINISHED', 'Stopped by user');
+    if (mounted) {
+      setState(() {
+        _isLoading = false;
+        _messages.add(
+          const ChatMessage(
+            role: 'assistant',
+            content: 'Task was stopped manually. The screen stream has been closed.',
+          ),
+        );
+      });
+      _scrollToBottom();
+    }
   }
 
   @override
@@ -397,7 +409,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     try {
       final handoff = await ChatHistoryService.consumeOverlayMessages();
       if (!mounted || handoff.isEmpty) return;
-
       final imported = handoff.map(ChatMessage.fromJson).toList();
       for (final message in imported) {
         if (message.actionResult == null) {
@@ -416,16 +427,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   int _overlayUpdateGeneration = 0;
   bool _importingOverlayHistory = false;
-
   Future<void> _updateOverlayState() async {
     if (!FeatureFlags.floatingOverlayEnabled) return;
     final generation = ++_overlayUpdateGeneration;
     final isBackground = _appLifecycleState == AppLifecycleState.paused;
     final shouldBeActive = isBackground;
-
     bool granted = await FlutterOverlayWindow.isPermissionGranted();
     if (!granted || generation != _overlayUpdateGeneration) return;
-
     bool active = await FlutterOverlayWindow.isActive();
     if (generation != _overlayUpdateGeneration) return;
     if (shouldBeActive && !active) {
@@ -467,7 +475,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           'OVERLAY_RESET|',
         ).timeout(const Duration(milliseconds: 150));
       } catch (_) {}
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await Future.delayed(const Duration(milliseconds: 50));
       if (generation != _overlayUpdateGeneration) return;
       if (_appLifecycleState == AppLifecycleState.paused) return;
       await FlutterOverlayWindow.closeOverlay();
@@ -477,7 +485,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
-
     return Scaffold(
       backgroundColor: isDark
           ? const Color(0xFF0C0A15)
@@ -549,19 +556,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         children: [
           // Background mesh glows
           _buildBackgroundGlows(isDark),
-
           Positioned.fill(
             child: BackdropFilter(
               filter: ImageFilter.blur(sigmaX: 100, sigmaY: 100),
               child: Container(color: Colors.transparent),
             ),
           ),
-
           Column(
             children: [
               // Pill selector switcher
               _buildModeSelector(isDark),
-
               // API key warning banner
               if (!_aiService.isConfigured)
                 Container(
@@ -617,7 +621,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     ],
                   ),
                 ),
-
               // Chat content area
               Expanded(
                 child: _messages.isEmpty
@@ -635,7 +638,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         },
                       ),
               ),
-
               // Think loading indicator
               if (_isLoading)
                 Padding(
@@ -661,20 +663,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         'Thinking...',
                         style: TextStyle(
                           fontSize: 12,
-                          color: isDark
-                              ? const Color(0xFF9E9BAC)
+                          color: isDark ? const Color(0xFF9E9BAC)
                               : const Color(0xFF6C6A7C),
                           fontWeight: FontWeight.w500,
                         ),
                       ),
                       const SizedBox(width: 8),
                       TextButton.icon(
-                        onPressed: () {
-                          _actionHandler.cancelTask();
-                          setState(() {
-                            _isLoading = false;
-                          });
-                        },
+                        onPressed: _isLoading ? _cancelRunningTask : null,
                         icon: const Icon(
                           Icons.stop_circle_rounded,
                           size: 16,
@@ -697,7 +693,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     ],
                   ),
                 ),
-
               // Custom Input bar
               _buildInputBar(isDark),
             ],
@@ -746,7 +741,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ],
             ),
           ),
-
           // New Chat Button
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
@@ -799,9 +793,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ),
             ),
           ),
-
           const Divider(indent: 16, endIndent: 16, height: 20),
-
           // Section CHAT HISTORY
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 6),
@@ -818,7 +810,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ),
             ),
           ),
-
           // Chat Sessions List
           Expanded(
             child: FutureBuilder<List<ChatSession>>(
@@ -835,7 +826,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     ),
                   );
                 }
-
                 final sessions = snapshot.data!;
                 return ListView.builder(
                   padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -843,7 +833,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   itemBuilder: (context, index) {
                     final session = sessions[index];
                     final isCurrent = session.id == _sessionId;
-
                     return Container(
                       margin: const EdgeInsets.symmetric(
                         vertical: 2,
@@ -882,13 +871,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: textStyle.copyWith(
-                            fontWeight: isCurrent
-                                ? FontWeight.bold
+                            fontWeight: isCurrent ? FontWeight.bold
                                 : FontWeight.w500,
                             color: isCurrent
                                 ? (isDark
-                                      ? Colors.white
-                                      : const Color(0xFF1E293B))
+                                    ? Colors.white
+                                    : const Color(0xFF1E293B))
                                 : null,
                           ),
                         ),
@@ -904,7 +892,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                               _startNewChat();
                             }
                             (context as Element)
-                                .markNeedsBuild(); // Re-trigger build refresh
+ .markNeedsBuild(); // Re-trigger build refresh
                           },
                         ),
                         onTap: () {
@@ -918,9 +906,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               },
             ),
           ),
-
           const Divider(indent: 16, endIndent: 16, height: 20),
-
           // Section TASKS & SETTINGS
           ListTile(
             horizontalTitleGap: 8,
@@ -1020,7 +1006,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Widget _buildModeSelector(bool isDark) {
     final activeBg = isDark ? const Color(0xFF1E293B) : const Color(0xFFE2E8F0);
-
     return Center(
       child: Container(
         margin: const EdgeInsets.symmetric(vertical: 12),
@@ -1060,7 +1045,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     bool isDark,
   ) {
     final isSelected = _mode == modeId;
-
     return GestureDetector(
       onTap: () {
         setState(() {
@@ -1093,20 +1077,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               icon,
               size: 15,
               color: isSelected
-                  ? Colors.white
+ ? Colors.white
                   : (isDark
-                        ? const Color(0xFF94A3B8)
-                        : const Color(0xFF475569)),
+                      ? const Color(0xFF94A3B8)
+                      : const Color(0xFF475569)),
             ),
             const SizedBox(width: 8),
             Text(
               label,
               style: TextStyle(
-                color: isSelected
-                    ? Colors.white
+                color: isSelected ? Colors.white
                     : (isDark
-                          ? const Color(0xFF94A3B8)
-                          : const Color(0xFF475569)),
+                        ? const Color(0xFF94A3B8)
+                        : const Color(0xFF475569)),
                 fontWeight: FontWeight.bold,
                 fontSize: 13,
               ),
@@ -1129,7 +1112,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     } else {
       timeGreeting = 'Hello.';
     }
-
     final suggestions = _mode == 'chat'
         ? [
             'Write a professional email',
@@ -1143,7 +1125,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             'Set volume to 80%',
             'What\'s on my screen?',
           ];
-
     return SingleChildScrollView(
       physics: const BouncingScrollPhysics(),
       child: Padding(
@@ -1191,7 +1172,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   fontSize: 11,
                   fontWeight: FontWeight.w800,
                   color: isDark
-                      ? const Color(0xFF94A3B8)
+ ? const Color(0xFF94A3B8)
                       : const Color(0xFF475569),
                   letterSpacing: 1.5,
                 ),
@@ -1217,8 +1198,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           vertical: 12,
                         ),
                         decoration: BoxDecoration(
-                          color: isDark
-                              ? const Color(0xFF151D30)
+                          color: isDark ? const Color(0xFF151D30)
                               : Colors.white,
                           borderRadius: BorderRadius.circular(16),
                           border: Border.all(
@@ -1276,8 +1256,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ? Colors.redAccent
                   : Theme.of(context).cardTheme.color,
               border: Border.all(
-                color: _isListening
-                    ? Colors.redAccent
+                color: _isListening ? Colors.redAccent
                     : Theme.of(context).colorScheme.onSurface.withOpacity(0.08),
                 width: 1.2,
               ),
@@ -1306,7 +1285,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
           ),
           const SizedBox(width: 10),
-
           // Custom Text input container
           Expanded(
             child: Container(
@@ -1348,12 +1326,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         border: InputBorder.none,
                       ),
                       textInputAction: TextInputAction.send,
-                      onSubmitted: _isLoading
-                          ? null
+                      onSubmitted: _isLoading ? null
                           : (text) => _sendMessage(text),
                     ),
                   ),
-
                   // Solid Send button
                   Container(
                     margin: const EdgeInsets.only(right: 6),
