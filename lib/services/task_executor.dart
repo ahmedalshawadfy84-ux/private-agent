@@ -4,13 +4,13 @@ import 'dart:developer' as developer;
 
 import 'ai_service.dart';
 import 'screen_automation_service.dart';
+import 'screen_projection_service.dart';
 import 'app_launcher_service.dart';
 import 'notification_service.dart';
 import 'task_history_logger.dart';
 import 'shizuku_service.dart';
 import 'skill_memory_service.dart';
 import 'recovery_engine.dart';
-
 import '../models/saved_skill.dart';
 
 /// Hybrid TaskExecutor:
@@ -19,9 +19,9 @@ import '../models/saved_skill.dart';
 class TaskExecutor {
   final AiService _aiService;
   final ScreenAutomationService _screenService;
+  final ScreenProjectionService _projectionService;
   final AppLauncherService _appLauncher;
   final ShizukuService _shizukuService;
-
   final NotificationService _notificationService = NotificationService();
   final SkillMemoryService _skillMemory = SkillMemoryService();
   final RecoveryEngine _recoveryEngine = RecoveryEngine();
@@ -29,24 +29,32 @@ class TaskExecutor {
   /// Callback to report progress messages to the UI.
   final void Function(String message)? onProgress;
 
+  /// Callback to publish a final status (success/failure reason) to the UI.
+  final void Function(String message)? onStatus;
+
   bool _cancelled = false;
+  bool _statusPublished = false;
   Completer<void>? _cancelCompleter;
+  StreamSubscription<String>? _projectionEventSubscription;
+  StreamSubscription<String>? _consentSubscription;
 
   TaskExecutor({
     required AiService aiService,
     required ScreenAutomationService screenService,
+    required ScreenProjectionService projectionService,
     required AppLauncherService appLauncher,
     required ShizukuService shizukuService,
     this.onProgress,
+    this.onStatus,
   })  : _aiService = aiService,
         _screenService = screenService,
+        _projectionService = projectionService,
         _appLauncher = appLauncher,
         _shizukuService = shizukuService;
 
   /// Cancel the running task.
   void cancel() {
     _cancelled = true;
-
     if (_cancelCompleter != null && !_cancelCompleter!.isCompleted) {
       _cancelCompleter!.complete();
     }
@@ -55,20 +63,15 @@ class TaskExecutor {
   /// Text-mode system prompt for normal apps.
   static const String _textTaskSystemPrompt = '''
 You are a phone automation agent. You are given a TASK and the current SCREEN content.
-
 You must decide what single action to take next to accomplish the task.
-
 Respond with ONLY a JSON object, no markdown, no code fences:
-
 {
   "action": "action_name",
   "params": {"key": "value"},
   "reasoning": "brief reason",
   "is_complete": false
 }
-
 Available actions:
-
 - click_text: {"text": "exact text to click"} - Click an element by its visible text.
 - click_at: {"x": 540, "y": 960} - Click at screen coordinates.
 - type_text: {"text": "hello", "field_hint": "optional hint"} - Type into focused/first edit field.
@@ -80,9 +83,7 @@ Available actions:
 - open_app: {"app_name": "YouTube"} - Open an app.
 - wait: {} - Wait for loading.
 - done: {} - Task is complete.
-
 Rules:
-
 - You will receive a TEXT DUMP of the accessibility tree with visible text and coordinates.
 - ALWAYS use the text dump to decide your action.
 - Prefer click_text for visible text. Use click_at only when no text exists.
@@ -100,22 +101,16 @@ Rules:
   /// Visual-mode system prompt for games only.
   static const String _visualGameSystemPrompt = '''
 You are a visual mobile game automation agent.
-
 You are provided with a SCREENSHOT of a mobile game or canvas-rendered UI, such as Unity, OpenGL, Vulkan, Canvas, or a UI with no useful accessibility nodes.
-
 You must visually analyze the image and decide the next single action.
-
 Respond with ONLY a JSON object, no markdown, no code fences:
-
 {
   "action": "action_name",
   "params": {"key": "value"},
   "reasoning": "brief visual reason",
   "is_complete": false
 }
-
 Available actions:
-
 - click_at: {"x": 540, "y": 960} - Tap exact visual coordinates.
 - swipe: {"startX": 540, "startY": 1500, "endX": 540, "endY": 800} - Swipe or drag.
 - type_text: {"text": "name"} - Type text if an input field is focused.
@@ -125,9 +120,7 @@ Available actions:
 - open_app: {"app_name": "GameName"} - Open the requested game/app.
 - wait: {} - Wait for animations/loading.
 - done: {} - Goal completed.
-
 Rules:
-
 - This mode is for games only.
 - Game UIs may not expose accessibility text. Use the screenshot visually.
 - Use click_at and swipe for game controls, menus, buttons, puzzles, characters, items, and drag actions.
@@ -142,18 +135,14 @@ Rules:
   String _extractJson(String text) {
     final codeBlockRegex = RegExp(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```');
     final match = codeBlockRegex.firstMatch(text);
-
     if (match != null) {
       return match.group(1)!;
     }
-
     final startIndex = text.indexOf('{');
     final endIndex = text.lastIndexOf('}');
-
     if (startIndex != -1 && endIndex != -1 && endIndex > startIndex) {
       return text.substring(startIndex, endIndex + 1);
     }
-
     return text.trim();
   }
 
@@ -162,20 +151,65 @@ Rules:
     await ScreenAutomationService.logToNative(
       '[TaskExecutor] executeTask() called with goal: $userGoal',
     );
-
     _cancelled = false;
+    _statusPublished = false;
+    _projectionService.markStopped();
+    _projectionEventSubscription ??= _projectionService.events.listen(_onProjectionEvent);
+
+    // ── 1. Start the MediaProjection foreground service ────────────────
+    // The capture session must remain live for the entire task. If we cannot
+    // start it (e.g. user denied consent), we refuse to execute and tell the
+    // user exactly why, per the lifecycle rules.
+    try {
+      final running = await _projectionService.isRunning();
+      if (!running) {
+        // Subscribe to the consent event BEFORE triggering the dialog, so we
+        // do not miss the "consent|granted" / "consent|denied" reply.
+        final granted = await _requestConsentWithTimeout();
+        if (!granted) {
+          const reason =
+              'Screen capture consent was not granted. The task was not started.';
+          _publishStatus(reason);
+          await TaskHistoryLogger.logTask(
+            userGoal,
+            'Failed',
+            0,
+            0,
+            [reason],
+          );
+          return reason;
+        }
+        _projectionService.markStarted();
+      } else {
+        _projectionService.markStarted();
+      }
+    } catch (e) {
+      const reason =
+          'Screen capture service is unavailable on this device. The task was not started.';
+      _publishStatus('$reason ($e)');
+      await TaskHistoryLogger.logTask(
+        userGoal,
+        'Failed',
+        0,
+        0,
+        ['$reason ($e)'],
+      );
+      return reason;
+    }
 
     final isRunning = await _screenService.isServiceRunning();
-
     if (!isRunning) {
-      return 'Accessibility service is not enabled. Go to Settings → Accessibility → PrivateAgent Screen Control and enable it.';
+      const reason =
+          'Accessibility service is not enabled. Go to Settings → Accessibility → PrivateAgent Screen Control and enable it.';
+      await _teardownProjection(reason: reason);
+      _publishStatus(reason);
+      return reason;
     }
 
     final results = <String>[];
     results.add('Starting task: $userGoal');
 
     final bool isGameTask = _isLikelyGameGoal(userGoal);
-
     if (isGameTask) {
       _report('Starting visual game task: $userGoal');
     } else {
@@ -187,28 +221,22 @@ Rules:
     int sameActionCount = 0;
     int consecutiveFailures = 0;
     String lastFailedAction = '';
-
     final List<ActionStep> executedSteps = [];
 
     /// Use skill memory only for normal app tasks.
     /// For games, recorded coordinates may be unreliable because game screens change.
     if (!isGameTask) {
       final savedSkill = await _skillMemory.findSkill(userGoal);
-
       if (savedSkill != null && savedSkill.isReliable) {
         _report('Found saved skill. Replaying ${savedSkill.steps.length} steps...');
-
         final replaySuccess = await _replaySkill(savedSkill, results);
-
         if (replaySuccess) {
           results.add('Task complete via skill memory.');
           _report('Task complete via memory.');
-
           await _notificationService.showTaskCompleteNotification(
             'Task Completed',
             'Agent finished its goal using memory.',
           );
-
           await TaskHistoryLogger.logTask(
             userGoal,
             'Success',
@@ -216,9 +244,10 @@ Rules:
             savedSkill.steps.length,
             results,
           );
-
           await _screenService.showToast('Task Complete!');
-
+          const stopReason = 'Task finished via saved skill';
+          await _teardownProjection(reason: stopReason);
+          _publishStatus('Done.');
           return 'Done.';
         } else {
           _report('Replay failed, falling back to AI...');
@@ -230,16 +259,12 @@ Rules:
     /// Shortcuts only for normal app tasks.
     if (!isGameTask) {
       final shortcut = _getNavigationShortcut(userGoal);
-
       if (shortcut != null && shortcut.isNotEmpty) {
         results.add('Using navigation shortcut: ${shortcut.length} steps');
         _report('Using navigation shortcut...');
-
         for (final step in shortcut) {
           if (_cancelled) break;
-
           final execution = await _executeAction(step.action, step.params);
-
           if (execution.success) {
             executedSteps.add(step);
             lastAction = step.action;
@@ -269,13 +294,11 @@ Rules:
       await Future.delayed(_delayForAction(lastAction));
 
       final bool useVisualMode = isGameTask;
-
       String screenContent = '';
       String? base64Image;
 
       if (useVisualMode) {
         base64Image = await _screenService.takeScreenshot();
-
         if (base64Image == null || base64Image.isEmpty) {
           _report('Failed to capture game screenshot. Retrying...');
           await Future.delayed(const Duration(seconds: 1));
@@ -285,7 +308,6 @@ Rules:
         screenContent = _aiService.useScreenCompression
             ? await _screenService.getCompressedScreenDescription(userGoal)
             : await _screenService.getScreenDescription();
-
         developer.log(
           '=== TEXT SCREEN DUMP Step ${step + 1} ===\n$screenContent',
           name: 'PrivateAgent',
@@ -297,10 +319,8 @@ Rules:
           : '';
 
       String failureHint = '';
-
       if (consecutiveFailures >= 3) {
         failureHint = '''
-        
 WARNING: You failed $consecutiveFailures times in a row.
 You MUST try a different action.
 Do NOT repeat the same failed action.
@@ -311,21 +331,16 @@ If open_app failed, press_home and look for the app.
 
       final String prompt = useVisualMode
           ? '''TASK: $userGoal
-
 Step ${step + 1}/${_aiService.maxSteps}.
-
 Analyze the provided game screenshot visually.
 Choose the next action using exact coordinates if needed.
 $previousResultStr$failureHint
 '''
           : '''TASK: $userGoal
-
 CURRENT SCREEN TEXT DUMP:
-
 $screenContent
 $previousResultStr
 $failureHint
-
 Step ${step + 1}/${_aiService.maxSteps}.
 Look at the text dump and coordinates. What is the next action?
 ''';
@@ -336,17 +351,14 @@ Look at the text dump and coordinates. What is the next action?
       );
 
       _AiActionResponse aiActionResponse;
-
       try {
         aiActionResponse = await _requestAiAction(
-          systemPrompt: useVisualMode
-              ? _visualGameSystemPrompt
+          systemPrompt: useVisualMode ? _visualGameSystemPrompt
               : _textTaskSystemPrompt,
           prompt: prompt,
           base64Image: base64Image,
           step: step,
         );
-
         totalTokens += aiActionResponse.totalTokens;
       } catch (e) {
         if (_cancelled) {
@@ -357,15 +369,12 @@ Look at the text dump and coordinates. What is the next action?
             results: results,
           );
         }
-
         results.add('AI error: $e');
         _report('AI error: $e');
-
         await _notificationService.showTaskCompleteNotification(
           'Task Error',
           'AI encountered an error.',
         );
-
         await TaskHistoryLogger.logTask(
           userGoal,
           'Failed',
@@ -373,10 +382,12 @@ Look at the text dump and coordinates. What is the next action?
           step,
           results,
         );
-
         await _screenService.showToast('AI Error');
-
-        return 'I could not complete the task because the AI service failed.';
+        const reason =
+            'The AI service stopped responding, so I had to stop the screen stream and cancel the task.';
+        await _teardownProjection(reason: reason);
+        _publishStatus(reason);
+        return reason;
       }
 
       if (_cancelled) {
@@ -403,36 +414,28 @@ Look at the text dump and coordinates. What is the next action?
         name: 'PrivateAgent',
       );
 
+      // Silent execution: do not echo step-level reasoning to the chat UI.
       _report('Step ${step + 1}: $reasoning');
 
       final String previousAction = lastAction;
-
       sameActionCount = action == lastAction ? sameActionCount + 1 : 1;
-
       final repeatLimit = action == 'press_enter'
           ? 2
           : (action == 'scroll' || action == 'swipe' ? 3 : 1000);
-
       if (sameActionCount > repeatLimit) {
         final blockedResult =
             'Blocked repeated $action action. Trying a different action.';
-
         results.add(blockedResult);
         _report(blockedResult);
-
         consecutiveFailures = 3;
         lastFailedAction = action;
         lastAction = action;
-
         continue;
       }
-
       lastAction = action;
 
       final bool requestedCompletion = action == 'done' || isComplete;
-
       _ExecutionResult execution;
-
       if (action == 'done') {
         execution = const _ExecutionResult(
           success: true,
@@ -441,7 +444,6 @@ Look at the text dump and coordinates. What is the next action?
       } else {
         execution = await _executeAction(action, params);
       }
-
       developer.log(
         '=== EXECUTION RESULT Step ${step + 1} ===\n${execution.message}',
         name: 'PrivateAgent',
@@ -454,19 +456,15 @@ Look at the text dump and coordinates. What is the next action?
           consecutiveFailures = 1;
           lastFailedAction = action;
         }
-
         if (consecutiveFailures >= 5) {
           results.add(
             'Agent is stuck after $consecutiveFailures consecutive failures.',
           );
-
           _report('Agent stuck. Stopping task.');
-
           await _notificationService.showTaskCompleteNotification(
             'Task Stuck',
             'Agent could not complete the task after repeated failures.',
           );
-
           await TaskHistoryLogger.logTask(
             userGoal,
             'Failed',
@@ -474,25 +472,23 @@ Look at the text dump and coordinates. What is the next action?
             step,
             results,
           );
-
           await _screenService.showToast('Agent stuck. Task stopped.');
-
-          return 'I could not complete the task. Please try again.';
+          const reason =
+              'The agent got stuck after repeated failures, so I stopped the screen stream and cancelled the task.';
+          await _teardownProjection(reason: reason);
+          _publishStatus(reason);
+          return reason;
         }
-
         /// Recovery is mainly useful for text-mode Android apps.
         if (!useVisualMode) {
           final recovery = await _recoveryEngine.diagnose(action, screenContent);
-
           _report('Recovering: ${recovery.description}');
-
           if (recovery.action == 'wait') {
             await Future.delayed(const Duration(seconds: 2));
           } else if (recovery.action == 'press_back') {
             await _screenService.pressBack();
           } else if (recovery.action == 'scroll') {
             final dir = recovery.params['direction'] ?? 'down';
-
             if (dir == 'down') {
               await _shizukuService.runCommand(
                 'input swipe 540 1800 540 600 600',
@@ -505,18 +501,15 @@ Look at the text dump and coordinates. What is the next action?
           } else if (recovery.action == 'press_home') {
             await _screenService.pressHome();
           }
-
           results.add('Recovery step: ${recovery.description}');
         } else {
           results.add('Visual action failed: ${execution.message}');
           await Future.delayed(const Duration(seconds: 1));
         }
-
         continue;
       } else {
         consecutiveFailures = 0;
         lastFailedAction = '';
-
         if (action != 'done') {
           executedSteps.add(
             ActionStep(
@@ -539,22 +532,18 @@ Look at the text dump and coordinates. What is the next action?
           previousAction: previousAction,
           executedSteps: executedSteps,
         );
-
         if (!canComplete) {
           results.add('Ignored premature completion request.');
           _report('Ignoring premature completion. Continuing...');
           await Future.delayed(const Duration(milliseconds: 1200));
           continue;
         }
-
         results.add('Task complete.');
         _report('Task complete.');
-
         await _notificationService.showTaskCompleteNotification(
           'Task Completed',
           reasoning.trim().isEmpty ? 'Agent finished its goal.' : reasoning,
         );
-
         await TaskHistoryLogger.logTask(
           userGoal,
           'Success',
@@ -562,15 +551,16 @@ Look at the text dump and coordinates. What is the next action?
           step + 1,
           results,
         );
-
         /// Save skills only for normal app tasks.
         if (!isGameTask && executedSteps.isNotEmpty) {
           await _skillMemory.saveSkill(userGoal, executedSteps);
         }
-
         await _screenService.showToast('Task Complete!');
-
-        return reasoning.trim().isEmpty ? 'Done.' : reasoning.trim();
+        const stopReason = 'Task finished successfully';
+        await _teardownProjection(reason: stopReason);
+        final reply = reasoning.trim().isEmpty ? 'Done.' : reasoning.trim();
+        _publishStatus(reply);
+        return reply;
       }
 
       if ((step + 1) % 3 == 0) {
@@ -581,14 +571,11 @@ Look at the text dump and coordinates. What is the next action?
     results.add(
       'Reached maximum steps (${_aiService.maxSteps}). Task may be incomplete.',
     );
-
     _report('Reached maximum steps.');
-
     await _notificationService.showTaskCompleteNotification(
       'Task Stopped',
       'Reached maximum steps (${_aiService.maxSteps}).',
     );
-
     await TaskHistoryLogger.logTask(
       userGoal,
       'Failed',
@@ -596,10 +583,12 @@ Look at the text dump and coordinates. What is the next action?
       _aiService.maxSteps,
       results,
     );
-
     await _screenService.showToast('Reached maximum steps.');
-
-    return 'I could not complete the task within the allowed steps.';
+    const reason =
+ 'The agent reached the maximum number of steps, so I stopped the screen stream and cancelled the task.';
+    await _teardownProjection(reason: reason);
+    _publishStatus(reason);
+    return reason;
   }
 
   Future<_AiActionResponse> _requestAiAction({
@@ -610,29 +599,23 @@ Look at the text dump and coordinates. What is the next action?
   }) async {
     String response;
     int totalTokens = 0;
-
     try {
       _cancelCompleter = Completer<void>();
-
       final aiFuture = _aiService.sendTaskMessage(
         systemPrompt,
         prompt,
         base64Image: base64Image,
       );
-
       final result = await Future.any([
         aiFuture.then((r) => r),
         _cancelCompleter!.future.then((_) => null),
       ]);
-
       if (result == null || _cancelled) {
         throw Exception('Task cancelled.');
       }
-
       final aiResponse = result as AiResponse;
       response = aiResponse.content;
       totalTokens += aiResponse.totalTokens;
-
       developer.log(
         '=== RAW AI RESPONSE Step ${step + 1} ===\n$response',
         name: 'PrivateAgent',
@@ -649,24 +632,18 @@ Look at the text dump and coordinates. What is the next action?
         'Error: $firstError\nRaw: $response',
         name: 'PrivateAgent',
       );
-
       _report('Retrying step ${step + 1} due to formatting error...');
-
       await Future.delayed(const Duration(seconds: 2));
-
       final retryResponse = await _aiService.sendTaskMessage(
         systemPrompt,
         prompt,
         base64Image: base64Image,
       );
-
       totalTokens += retryResponse.totalTokens;
-
       developer.log(
         '=== RETRY AI RESPONSE Step ${step + 1} ===\n${retryResponse.content}',
         name: 'PrivateAgent',
       );
-
       return _parseAiAction(retryResponse.content, totalTokens);
     }
   }
@@ -674,12 +651,10 @@ Look at the text dump and coordinates. What is the next action?
   _AiActionResponse _parseAiAction(String response, int totalTokens) {
     final jsonStr = _extractJson(response);
     final decoded = jsonDecode(jsonStr) as Map<String, dynamic>;
-
     final rawParams = decoded['params'];
     final params = rawParams is Map
         ? Map<String, dynamic>.from(rawParams)
         : <String, dynamic>{};
-
     return _AiActionResponse(
       action: decoded['action'] as String? ?? 'wait',
       params: params,
@@ -695,81 +670,68 @@ Look at the text dump and coordinates. What is the next action?
   ) async {
     bool success = false;
     String message = '';
-
     switch (action) {
       case 'click_text':
         final text = params['text'] as String? ?? '';
         success = await _screenService.clickByText(text);
         message = success ? 'Clicked "$text"' : 'Could not find "$text"';
         break;
-
       case 'click_at':
         final x = (params['x'] as num?)?.toDouble() ?? 0;
         final y = (params['y'] as num?)?.toDouble() ?? 0;
         success = await _screenService.clickAt(x, y);
         message = success ? 'Clicked at ($x, $y)' : 'Click failed';
         break;
-
       case 'type_text':
         final text = params['text'] as String? ?? '';
         final hint = params['field_hint'] as String?;
         success = await _screenService.typeText(text, fieldHint: hint);
         message = success ? 'Typed "$text"' : 'Could not type text';
         break;
-
       case 'press_enter':
         success = await _submitKeyboardAction();
         message = success
             ? 'Submitted the focused field'
             : 'Could not submit the focused field';
         break;
-
       case 'scroll':
         final direction = params['direction'] as String? ?? 'down';
         success = await _performScroll(direction);
         message = success ? 'Scrolled $direction' : 'Could not scroll';
         break;
-
       case 'swipe':
         final startX = (params['startX'] as num?)?.toDouble() ?? 540;
         final startY = (params['startY'] as num?)?.toDouble() ?? 1800;
         final endX = (params['endX'] as num?)?.toDouble() ?? 540;
         final endY = (params['endY'] as num?)?.toDouble() ?? 600;
-
         success = await _performSwipe(startX, startY, endX, endY);
         message = success
             ? 'Swiped from ($startX, $startY) to ($endX, $endY)'
             : 'Swipe failed';
         break;
-
       case 'press_back':
         success = await _screenService.pressBack();
         message = 'Pressed back';
         break;
-
       case 'press_home':
         success = await _screenService.pressHome();
         message = 'Pressed home';
         break;
-
       case 'open_app':
         final appName = params['app_name'] as String? ?? '';
         message = await _appLauncher.openApp(appName);
         success = message.startsWith('Opened');
         break;
-
       case 'wait':
         await Future.delayed(const Duration(seconds: 1));
         success = true;
         message = 'Waited';
         break;
-
       default:
         success = false;
         message = 'Unknown action: $action';
         break;
     }
-
     return _ExecutionResult(success: success, message: message);
   }
 
@@ -781,12 +743,10 @@ Look at the text dump and coordinates. What is the next action?
   }) async {
     results.add('Task cancelled by user.');
     _report('Task cancelled.');
-
     await _notificationService.showTaskCompleteNotification(
       'Task Cancelled',
       'Task was stopped by the user.',
     );
-
     await TaskHistoryLogger.logTask(
       userGoal,
       'Cancelled',
@@ -794,19 +754,101 @@ Look at the text dump and coordinates. What is the next action?
       step,
       results,
     );
-
     await _screenService.showToast('Task Cancelled');
-
+    const reason =
+        'Task was stopped because the user cancelled it, so I closed the screen stream.';
+    await _teardownProjection(reason: reason);
+    _publishStatus(reason);
     return 'Task cancelled.';
   }
 
   void _report(String message) {
-    onProgress?.call(message);
+    // Silent execution: by default we DO NOT forward progress chatter to the
+    // chat UI. Only fatal lifecycle events (success, failure, cancellation,
+    // service errors) are surfaced via [onStatus].
+    developer.log('[TaskExecutor] $message', name: 'PrivateAgent');
+  }
+
+  /// Tears down the MediaProjection session. Call this when the task ends —
+ /// success, failure, or unrecoverable error. Per the lifecycle rules, the
+  /// service must NEVER be stopped while a task is still running.
+  Future<void> _teardownProjection({required String reason}) async {
+    try {
+      await _projectionService.stop(reason: reason);
+    } catch (e) {
+      developer.log(
+        'Failed to stop MediaProjection: $e',
+        name: 'PrivateAgent',
+      );
+    }
+  }
+
+  /// Resolves once the user accepts or denies the MediaProjection consent.
+  /// Returns `true` if consent was granted, `false` otherwise.
+  Future<bool> _requestConsentWithTimeout() async {
+    final completer = Completer<bool>();
+    late StreamSubscription<String> sub;
+    sub = _projectionService.events.listen((event) {
+      if (!event.startsWith('consent|')) return;
+      if (completer.isCompleted) return;
+      if (event.contains('granted')) {
+        completer.complete(true);
+      } else if (event.contains('denied') || event.contains('error')) {
+        completer.complete(false);
+      }
+      sub.cancel();
+    });
+    final launched = await _projectionService.requestConsent();
+    if (!launched && !completer.isCompleted) {
+      await sub.cancel();
+      completer.complete(false);
+    }
+    return completer.future.timeout(
+      const Duration(seconds: 60),
+      onTimeout: () {
+        sub.cancel();
+        return false;
+      },
+    );
+  }
+
+  /// Listens to MediaProjection lifecycle events from the native side.
+  /// If the OS stops the projection mid-task (e.g. user revokes the consent
+  /// from the privacy indicator), we cancel the agent loop immediately and
+  /// report a clear reason to the chat.
+  void _onProjectionEvent(String event) {
+    if (event.startsWith('consent|')) return;
+    if (event.startsWith('stopped')) {
+      if (!_cancelled) {
+        _cancelled = true;
+        _cancelCompleter?.complete();
+        _publishStatus(
+          'Screen stream was closed by the system, so I cancelled the task.',
+        );
+      }
+    } else if (event.startsWith('error')) {
+      if (!_cancelled) {
+        _cancelled = true;
+        _cancelCompleter?.complete();
+        _publishStatus(
+          'Screen capture reported an error ($event), so I cancelled the task.',
+        );
+      }
+    } else if (event.startsWith('started')) {
+      _projectionService.markStarted();
+    }
+  }
+
+  /// Publishes a single terminal status message to the chat. Subsequent
+  /// calls are ignored so the user never sees a duplicate summary.
+  void _publishStatus(String message) {
+    if (_statusPublished) return;
+    _statusPublished = true;
+    onStatus?.call(message);
   }
 
   Future<void> _leavePrivateAgentIfNeeded() async {
     final currentPkg = await _screenService.getCurrentPackage();
-
     if (currentPkg == 'com.orailnoor.privateagent') {
       _report('Moving PrivateAgent to background...');
       await _screenService.pressHome();
@@ -818,23 +860,18 @@ Look at the text dump and coordinates. What is the next action?
     if (action == 'open_app') {
       return const Duration(milliseconds: 3500);
     }
-
     if (action == 'type_text') {
       return const Duration(milliseconds: 1800);
     }
-
     if (action == 'click_text' || action == 'click_at') {
       return const Duration(milliseconds: 1500);
     }
-
     if (action == 'swipe') {
       return const Duration(milliseconds: 1800);
     }
-
     if (action == 'scroll') {
       return const Duration(milliseconds: 1000);
     }
-
     return const Duration(milliseconds: 1200);
   }
 
@@ -842,16 +879,12 @@ Look at the text dump and coordinates. What is the next action?
     if (await _screenService.pressEnter()) {
       return true;
     }
-
     final shizukuAvailable = await _shizukuService.checkAvailability();
-
     if (!shizukuAvailable) {
       return false;
     }
-
     final result = await _shizukuService.runCommand('input keyevent 66');
     final normalized = result.toLowerCase();
-
     return !normalized.contains('not running') &&
         !normalized.contains('permission denied') &&
         !normalized.startsWith('error');
@@ -861,9 +894,7 @@ Look at the text dump and coordinates. What is the next action?
     if (await _screenService.scroll(direction)) {
       return true;
     }
-
     final isDown = direction.toLowerCase() == 'down';
-
     return _performSwipe(
       540,
       isDown ? 1800 : 600,
@@ -881,20 +912,15 @@ Look at the text dump and coordinates. What is the next action?
     if (await _screenService.swipe(startX, startY, endX, endY)) {
       return true;
     }
-
     final shizukuAvailable = await _shizukuService.checkAvailability();
-
     if (!shizukuAvailable) {
       return false;
     }
-
     final result = await _shizukuService.runCommand(
       'input swipe ${startX.toInt()} ${startY.toInt()} '
       '${endX.toInt()} ${endY.toInt()} 600',
     );
-
     final normalized = result.toLowerCase();
-
     return !normalized.contains('not running') &&
         !normalized.contains('permission denied') &&
         !normalized.startsWith('error');
@@ -902,7 +928,6 @@ Look at the text dump and coordinates. What is the next action?
 
   bool _isLikelyGameGoal(String goal) {
     final lower = goal.toLowerCase();
-
     final gameKeywords = <String>[
       'game',
       'games',
@@ -953,13 +978,11 @@ Look at the text dump and coordinates. What is the next action?
       'genshin',
       'fortnite',
     ];
-
     return gameKeywords.any((keyword) => lower.contains(keyword));
   }
 
   bool _goalHasMoreThanOpenApp(String goal) {
     final lower = goal.toLowerCase();
-
     final extraActionKeywords = <String>[
       'واكتب',
       'اكتب',
@@ -987,25 +1010,21 @@ Look at the text dump and coordinates. What is the next action?
       'and type',
       'and click',
     ];
-
     return extraActionKeywords.any((keyword) => lower.contains(keyword));
   }
 
   bool _isOpenOnlyGoal(String goal) {
     final lower = goal.toLowerCase().trim();
-
     final startsWithOpen = lower.startsWith('open ') ||
         lower.startsWith('افتح ') ||
         lower.startsWith('شغل ') ||
         lower.startsWith('افتحي ') ||
         lower.startsWith('شغلي ');
-
     return startsWithOpen && !_goalHasMoreThanOpenApp(goal);
   }
 
   bool _goalRequiresTyping(String goal) {
     final lower = goal.toLowerCase();
-
     return lower.contains('اكتب') ||
         lower.contains('واكتب') ||
         lower.contains('type') ||
@@ -1014,7 +1033,6 @@ Look at the text dump and coordinates. What is the next action?
 
   bool _goalRequiresSearchSubmit(String goal) {
     final lower = goal.toLowerCase();
-
     return lower.contains('ابحث') ||
         lower.contains('وابحث') ||
         lower.contains('بحث') ||
@@ -1030,44 +1048,35 @@ Look at the text dump and coordinates. What is the next action?
     required List<ActionStep> executedSteps,
   }) {
     final requestedCompletion = action == 'done' || isComplete;
-
     if (!requestedCompletion) {
       return false;
     }
-
     /// Opening an app can be completion only if the goal is just "open X".
     if (action == 'open_app') {
       return _isOpenOnlyGoal(userGoal);
     }
-
     /// If the previous action was opening an app and the task has more parts,
     /// do not accept completion immediately.
     if (previousAction == 'open_app' && _goalHasMoreThanOpenApp(userGoal)) {
       return false;
     }
-
     /// Do not accept completion too early for compound goals.
     if (step < 2 && _goalHasMoreThanOpenApp(userGoal)) {
       return false;
     }
-
     final actions = executedSteps.map((e) => e.action).toList();
-
     if (_goalRequiresTyping(userGoal) && !actions.contains('type_text')) {
       return false;
     }
-
     if (_goalRequiresSearchSubmit(userGoal)) {
       final hasTyped = actions.contains('type_text');
       final hasSubmitted = actions.contains('press_enter') ||
           actions.contains('click_text') ||
           actions.contains('click_at');
-
       if (!hasTyped || !hasSubmitted) {
         return false;
       }
     }
-
     return true;
   }
 
@@ -1075,41 +1084,31 @@ Look at the text dump and coordinates. What is the next action?
     for (int i = 0; i < skill.steps.length; i++) {
       if (_cancelled) {
         return false;
-      }
-
+ }
       final step = skill.steps[i];
-
       _report('Replaying step ${i + 1}/${skill.steps.length}: ${step.action}');
-
       await Future.delayed(_delayForAction(step.action));
-
       final execution = await _executeAction(step.action, step.params);
-
       results.add('Memory Replay Step ${i + 1}: ${execution.message}');
-
       developer.log(
         '=== MEMORY REPLAY RESULT ===\n${execution.message}',
         name: 'PrivateAgent',
       );
-
       if (!execution.success) {
         return false;
       }
     }
-
     return true;
   }
 
   List<ActionStep>? _getNavigationShortcut(String goal) {
     final lower = goal.toLowerCase();
-
     if (lower.contains('dark mode') || lower.contains('dark theme')) {
       return [
         ActionStep(action: 'open_app', params: {'app_name': 'Settings'}),
         ActionStep(action: 'click_text', params: {'text': 'Display'}),
       ];
     }
-
     if (lower.contains('wifi') || lower.contains('wi-fi')) {
       return [
         ActionStep(action: 'open_app', params: {'app_name': 'Settings'}),
@@ -1119,14 +1118,12 @@ Look at the text dump and coordinates. What is the next action?
         ),
       ];
     }
-
     if (lower.contains('bluetooth')) {
       return [
         ActionStep(action: 'open_app', params: {'app_name': 'Settings'}),
         ActionStep(action: 'click_text', params: {'text': 'Connected devices'}),
       ];
     }
-
     final appPatterns = <String, List<String>>{
       'Settings': [
         'settings',
@@ -1222,7 +1219,6 @@ Look at the text dump and coordinates. What is the next action?
         'احسب',
       ],
     };
-
     for (final entry in appPatterns.entries) {
       for (final keyword in entry.value) {
         if (lower.contains(keyword)) {
@@ -1232,21 +1228,16 @@ Look at the text dump and coordinates. What is the next action?
         }
       }
     }
-
     final openMatch = RegExp(r'^open\s+([a-zA-Z0-9 ]+)').firstMatch(lower);
-
     if (openMatch != null) {
       String app = openMatch.group(1)!.trim();
-
       if (app.isNotEmpty) {
         app = app[0].toUpperCase() + app.substring(1);
-
         return [
-          ActionStep(action: 'open_app', params: {'app_name': app}),
+ ActionStep(action: 'open_app', params: {'app_name': app}),
         ];
       }
     }
-
     return null;
   }
 }
@@ -1257,7 +1248,6 @@ class _AiActionResponse {
   final String reasoning;
   final bool isComplete;
   final int totalTokens;
-
   const _AiActionResponse({
     required this.action,
     required this.params,
@@ -1270,7 +1260,6 @@ class _AiActionResponse {
 class _ExecutionResult {
   final bool success;
   final String message;
-
   const _ExecutionResult({
     required this.success,
     required this.message,
