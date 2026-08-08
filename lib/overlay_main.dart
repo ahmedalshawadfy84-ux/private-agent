@@ -10,6 +10,7 @@ import 'package:android_intent_plus/flag.dart';
 import 'services/ai_service.dart';
 import 'services/task_executor.dart';
 import 'services/screen_automation_service.dart';
+import 'services/screen_projection_service.dart';
 import 'services/app_launcher_service.dart';
 import 'services/shizuku_service.dart';
 import 'services/chat_history_service.dart';
@@ -34,6 +35,7 @@ class _OverlayAppState extends State<OverlayApp> {
 
   late final AiService _aiService;
   late final ScreenAutomationService _screenService;
+  late final ScreenProjectionService _projectionService;
   late final AppLauncherService _appLauncher;
   late final ShizukuService _shizukuService;
   late final Future<void> _servicesReady;
@@ -48,6 +50,7 @@ class _OverlayAppState extends State<OverlayApp> {
 
     _aiService = AiService();
     _screenService = ScreenAutomationService();
+    _projectionService = ScreenProjectionService();
     _appLauncher = AppLauncherService();
     _shizukuService = ShizukuService();
     _servicesReady = _initializeServices();
@@ -229,6 +232,7 @@ class _OverlayAppState extends State<OverlayApp> {
       _executor = TaskExecutor(
         aiService: _aiService,
         screenService: _screenService,
+        projectionService: _projectionService,
         appLauncher: _appLauncher,
         shizukuService: _shizukuService,
         onProgress: (msg) {
